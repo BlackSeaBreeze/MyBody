@@ -28,7 +28,7 @@
 **3. Сервисный аккаунт для деплоя**
 
 - [Service accounts → Create](https://console.cloud.google.com/iam-admin/serviceaccounts?project=mybody-dev-env): имя **`github-actions-deploy`**.
-- Роли: **Cloud Run Admin**, **Artifact Registry Writer**, **Service Account User**, **Storage Object Admin** (нужен для доступа к бакету Cloud Build `PROJECT_ID_cloudbuild` при `gcloud builds submit`).
+- Роли: **Cloud Run Admin**, **Artifact Registry Writer**, **Service Account User**, **Storage Object Admin** (доступ к дефолтному бакету Cloud Build `PROJECT_ID_cloudbuild` при `gcloud builds submit`). Роль можно выдать на проект или точечно на бакет `gs://mybody-dev-env_cloudbuild` в [Cloud Storage](https://console.cloud.google.com/storage/browser?project=mybody-dev-env).
 - Ключ создавать не нужно — доступ будет через WIF.
 
 **4. Workload Identity Pool и провайдер (один раз)**
