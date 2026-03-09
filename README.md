@@ -10,33 +10,78 @@
 
 Проект: **myBody-dev** (ID: `mybody-dev-env`) — [консоль GCP](https://console.cloud.google.com/welcome?project=mybody-dev-env).
 
-1. **Включите нужные API** в [консоли GCP](https://console.cloud.google.com/apis/library?project=mybody-dev-env):
-   - Cloud Run API  
-   - Artifact Registry API  
-   - Cloud Build API  
+Используется **Workload Identity Federation**: в GitHub не хранятся ключи, только идентификаторы проекта; доступ по короткоживущим токенам через GitHub OIDC.
 
-2. **Создайте репозиторий в Artifact Registry** (один раз):
-   - [Artifact Registry → Create repository](https://console.cloud.google.com/artifacts?project=mybody-dev-env)
-   - Имя: `mybody`
-   - Формат: Docker
-   - Регион: `europe-west1` (или тот же, что в workflow)
+**1. Включите API** в [консоли GCP](https://console.cloud.google.com/apis/library?project=mybody-dev-env):
 
-3. **Сервисный аккаунт для GitHub Actions**:
-   - [IAM → Service accounts → Create](https://console.cloud.google.com/iam-admin/serviceaccounts?project=mybody-dev-env)
-   - Имя, например: `github-actions-mybody`
-   - Роли: **Cloud Run Admin**, **Artifact Registry Writer**, **Service Account User**
-   - Создайте ключ (JSON) и сохраните файл — он понадобится для секрета в GitHub.
+- Cloud Run API  
+- Artifact Registry API  
+- Cloud Build API  
+- IAM API  
+- Security Token Service API (STS)  
+- [Единая ссылка на включение](https://console.cloud.google.com/flows/enableapi?apiid=run.googleapis.com,artifactregistry.googleapis.com,cloudbuild.googleapis.com,iam.googleapis.com,sts.googleapis.com&project=mybody-dev-env)
 
-### 2. Секреты в GitHub
+**2. Репозиторий Artifact Registry**
 
-В настройках репозитория: **Settings → Secrets and variables → Actions** добавьте:
+- [Artifact Registry → Create repository](https://console.cloud.google.com/artifacts?project=mybody-dev-env): имя **`mybody`**, формат Docker, регион **`europe-west1`**.
 
-| Секрет        | Значение |
-|---------------|----------|
-| `GCP_PROJECT_ID` | `mybody-dev-env` |
-| `GCP_SA_KEY`     | Содержимое **всего** JSON-файла ключа сервисного аккаунта (одной строкой) |
+**3. Сервисный аккаунт для деплоя**
 
-После этого каждый пуш в **`dev`** (или `main`) будет запускать сборку и деплой.
+- [Service accounts → Create](https://console.cloud.google.com/iam-admin/serviceaccounts?project=mybody-dev-env): имя **`github-actions-deploy`**.
+- Роли: **Cloud Run Admin**, **Artifact Registry Writer**, **Service Account User**.
+- Ключ создавать не нужно — доступ будет через WIF.
+
+**4. Workload Identity Pool и провайдер (один раз)**
+
+В [Cloud Shell](https://console.cloud.google.com/?cloudshell=true) или локально с `gcloud auth application-default login` выполните (подставьте свой **Project ID** и **номер проекта**; номер можно посмотреть в [настройках проекта](https://console.cloud.google.com/iam-admin/settings?project=mybody-dev-env) или командой `gcloud projects describe mybody-dev-env --format='value(projectNumber)'`):
+
+```bash
+export PROJECT_ID=mybody-dev-env
+export PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')
+
+# Пул
+gcloud iam workload-identity-pools create github-actions-pool \
+  --project="$PROJECT_ID" \
+  --location=global \
+  --display-name="GitHub Actions"
+
+# Провайдер (Trust GitHub OIDC; ограничение по репозиторию — подставьте свой owner/repo)
+gcloud iam workload-identity-pools providers create-oidc github-provider \
+  --project="$PROJECT_ID" \
+  --location=global \
+  --workload-identity-pool=github-actions-pool \
+  --display-name="GitHub" \
+  --issuer-uri="https://token.actions.githubusercontent.com/" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.repository_owner=assertion.repository_owner" \
+  --attribute-condition="assertion.repository_owner=='BlackSeaBreeze' && assertion.repository=='BlackSeaBreeze/MyBody'"
+```
+
+**5. Разрешить репозиторию использовать сервисный аккаунт**
+
+Тот же `PROJECT_ID` и `PROJECT_NUMBER`:
+
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  github-actions-deploy@${PROJECT_ID}.iam.gserviceaccount.com \
+  --project="$PROJECT_ID" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github-actions-pool/attribute.repository/BlackSeaBreeze/MyBody"
+```
+
+Если репозиторий другой — замените `BlackSeaBreeze/MyBody` на свой `OWNER/REPO` в `--attribute-condition` и в `--member`.
+
+### 2. Переменные в GitHub (без секретов)
+
+В настройках репозитория: **Settings → Secrets and variables → Actions → Variables** добавьте:
+
+| Переменная             | Значение          | Пример        |
+|------------------------|-------------------|---------------|
+| `GCP_PROJECT_ID`       | ID проекта GCP    | `mybody-dev-env` |
+| `GCP_PROJECT_NUMBER`   | Номер проекта    | см. в консоли или `gcloud projects describe mybody-dev-env --format='value(projectNumber)'` |
+
+Ключи в GitHub не нужны — аутентификация идёт через Workload Identity Federation.
+
+После этого каждый пуш в **`dev`** или **`main`** запускает сборку и деплой.
 
 ### 3. Регион
 
