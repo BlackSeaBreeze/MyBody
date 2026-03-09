@@ -1,9 +1,9 @@
-# Сборка и деплой MyBody в Google Cloud Run при пуше в main
+# Сборка и деплой MyBody в Google Cloud Run при пуше в dev или main
 name: Build and Deploy to Cloud Run
 
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
 
 env:
   REGION: europe-west1

@@ -4,25 +4,25 @@
 
 ## Деплой в Google Cloud Run (через GitHub)
 
-При пуше в ветку `main` проект автоматически собирается и деплоится в Cloud Run.
+При пуше в ветку **`dev`** (или `main`) проект автоматически собирается и деплоится в Cloud Run. Рабочая ветка — **`dev`**.
 
 ### 1. Подготовка проекта в Google Cloud
 
-Проект уже создан: [mybody-489721](https://console.cloud.google.com/welcome?project=mybody-489721).
+Проект: **myBody-dev** (ID: `mybody-dev-env`) — [консоль GCP](https://console.cloud.google.com/welcome?project=mybody-dev-env).
 
-1. **Включите нужные API** в [консоли GCP](https://console.cloud.google.com/apis/library?project=mybody-489721):
+1. **Включите нужные API** в [консоли GCP](https://console.cloud.google.com/apis/library?project=mybody-dev-env):
    - Cloud Run API  
    - Artifact Registry API  
    - Cloud Build API  
 
 2. **Создайте репозиторий в Artifact Registry** (один раз):
-   - [Artifact Registry → Create repository](https://console.cloud.google.com/artifacts?project=mybody-489721)
+   - [Artifact Registry → Create repository](https://console.cloud.google.com/artifacts?project=mybody-dev-env)
    - Имя: `mybody`
    - Формат: Docker
    - Регион: `europe-west1` (или тот же, что в workflow)
 
 3. **Сервисный аккаунт для GitHub Actions**:
-   - [IAM → Service accounts → Create](https://console.cloud.google.com/iam-admin/serviceaccounts?project=mybody-489721)
+   - [IAM → Service accounts → Create](https://console.cloud.google.com/iam-admin/serviceaccounts?project=mybody-dev-env)
    - Имя, например: `github-actions-mybody`
    - Роли: **Cloud Run Admin**, **Artifact Registry Writer**, **Service Account User**
    - Создайте ключ (JSON) и сохраните файл — он понадобится для секрета в GitHub.
@@ -33,10 +33,10 @@
 
 | Секрет        | Значение |
 |---------------|----------|
-| `GCP_PROJECT_ID` | `mybody-489721` |
+| `GCP_PROJECT_ID` | `mybody-dev-env` |
 | `GCP_SA_KEY`     | Содержимое **всего** JSON-файла ключа сервисного аккаунта (одной строкой) |
 
-После этого каждый пуш в `main` будет запускать сборку и деплой.
+После этого каждый пуш в **`dev`** (или `main`) будет запускать сборку и деплой.
 
 ### 3. Регион
 
