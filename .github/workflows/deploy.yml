@@ -43,6 +43,7 @@ jobs:
       - name: Build and push image
         run: |
           gcloud builds submit --quiet \
+            --gcs-source-staging-dir=gs://${{ vars.GCS_STAGING_BUCKET }}/source \
             --tag ${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }} \
             --tag ${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:latest \
             .

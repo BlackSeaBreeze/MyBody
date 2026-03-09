@@ -25,10 +25,21 @@
 
 - [Artifact Registry → Create repository](https://console.cloud.google.com/artifacts?project=mybody-dev-env): имя **`mybody`**, формат Docker, регион **`europe-west1`**.
 
+**2b. Бакет для загрузки исходников Cloud Build**
+
+Дефолтный бакет `PROJECT_ID_cloudbuild` в некоторых проектах недоступен для сервисных аккаунтов из WIF. Создайте свой бакет и выдайте права:
+
+1. [Cloud Storage → Create bucket](https://console.cloud.google.com/storage/create-bucket?project=mybody-dev-env): имя **уникальное** (например `mybody-dev-env-build-source`), регион любой.
+2. Выдать права на этот бакет:
+   - **`github-actions-deploy@mybody-dev-env.iam.gserviceaccount.com`** → **Storage Object Admin** (загрузка из GitHub Actions).
+   - **`401681859743@cloudbuild.gserviceaccount.com`** → **Storage Object Viewer** (Cloud Build читает исходники; номер замените на свой из [настройки проекта](https://console.cloud.google.com/iam-admin/settings?project=mybody-dev-env)).
+
+Имя бакета (без `gs://`) задайте в переменной **`GCS_STAGING_BUCKET`** в GitHub (см. п. 2 ниже).
+
 **3. Сервисный аккаунт для деплоя**
 
 - [Service accounts → Create](https://console.cloud.google.com/iam-admin/serviceaccounts?project=mybody-dev-env): имя **`github-actions-deploy`**.
-- Роли: **Cloud Run Admin**, **Artifact Registry Writer**, **Service Account User**, **Storage Admin** (полный доступ к Storage в проекте — нужен для загрузки исходников в дефолтный бакет Cloud Build `PROJECT_ID_cloudbuild` при `gcloud builds submit`).
+- Роли: **Cloud Run Admin**, **Artifact Registry Writer**, **Service Account User**. (Доступ к загрузке исходников — через бакет из п. 2b.)
 - Ключ создавать не нужно — доступ будет через WIF.
 
 **4. Workload Identity Pool и провайдер (один раз)**
@@ -77,7 +88,8 @@ gcloud iam service-accounts add-iam-policy-binding \
 | Переменная             | Значение          | Пример        |
 |------------------------|-------------------|---------------|
 | `GCP_PROJECT_ID`       | ID проекта GCP    | `mybody-dev-env` |
-| `GCP_PROJECT_NUMBER`   | Номер проекта    | см. в консоли или `gcloud projects describe mybody-dev-env --format='value(projectNumber)'` |
+| `GCP_PROJECT_NUMBER`   | Номер проекта     | см. в консоли или `gcloud projects describe mybody-dev-env --format='value(projectNumber)'` |
+| `GCS_STAGING_BUCKET`   | Имя бакета из п. 2b (без `gs://`) | `mybody-dev-env-build-source` |
 
 Ключи в GitHub не нужны — аутентификация идёт через Workload Identity Federation.
 
