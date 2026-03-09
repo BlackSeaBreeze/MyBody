@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env and secrets
+.env
+.env.local
+*.pem
+*-key.json
+!*-key.json.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
