@@ -60,6 +60,7 @@ jobs:
             --image ${{ env.REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }} \
             --region ${{ env.REGION }} \
             --platform managed \
-            --allow-unauthenticated
+            --allow-unauthenticated \
+            --set-secrets=GARMIN_EMAIL=garmin-email:latest,GARMIN_PASSWORD=garmin-password:latest
         env:
           CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}

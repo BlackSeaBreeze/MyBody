@@ -83,20 +83,82 @@ gcloud iam service-accounts add-iam-policy-binding \
 
 После этого каждый пуш в **`dev`** или **`main`** запускает сборку и деплой.
 
-### 3. Регион
+### 3. Почистка (опционально)
 
-В файле [.github/workflows/deploy.yml](.github/workflows/deploy.yml) по умолчанию указан регион `europe-west1`. Если нужен другой — измените переменную `REGION` и создайте репозиторий Artifact Registry в этом же регионе.
+Если раньше настраивали деплой через Cloud Build и GCS, можно убрать лишнее:
+
+- **GitHub:** переменную **`GCS_STAGING_BUCKET`** (Settings → Variables) — удалить, если есть.
+- **GCP, сервисный аккаунт `github-actions-deploy`:** снять роли **Storage Admin** и **Storage Object Admin** с проекта (IAM → выберить SA → Edit → убрать эти роли). Для текущего деплоя они не нужны.
+- **GCP, бакет `mybody-dev-env-build-source`:** если создавали для загрузки исходников и он больше не нужен — [удалить бакет](https://console.cloud.google.com/storage/browser?project=mybody-dev-env) (сначала удалить объекты внутри).
+
+### 4. Регион
+
+В [.github/workflows/deploy.yml](.github/workflows/deploy.yml) по умолчанию указан регион `europe-west1`. Если нужен другой — измените переменную `REGION` и создайте репозиторий Artifact Registry в этом же регионе.
 
 ## Локальный запуск
 
+Рекомендуется использовать виртуальное окружение. Из **корня проекта**:
+
+**Windows (PowerShell):**
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r backend/requirements.txt
+uvicorn backend.main:app --reload
+```
+
+**Windows (cmd) / Linux / macOS:**
 ```bash
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload
+python -m venv .venv
+.venv\Scripts\activate          # Windows cmd
+# source .venv/bin/activate     # Linux/macOS
+pip install -r backend/requirements.txt
+uvicorn backend.main:app --reload
 ```
 
 API: <http://localhost:8000>  
 Проверка: <http://localhost:8000/health>
+
+## Garmin Connect (прямое подключение)
+
+Данные с Garmin (активность, сон, статистика) забираются через библиотеку [garminconnect](https://pypi.org/project/garminconnect/).
+
+### Переменные окружения
+
+| Переменная | Описание |
+|------------|----------|
+| `GARMIN_EMAIL` | Email от аккаунта Garmin Connect |
+| `GARMIN_PASSWORD` | Пароль от аккаунта Garmin Connect |
+| `CRON_SECRET` | (Опционально.) Секрет для вызова эндпоинта загрузки (заголовок `X-Cron-Secret`) |
+
+### Логин и пароль в Secret Manager (Cloud Run)
+
+1. **Создать секреты в GCP**  
+   [Secret Manager → Create secret](https://console.cloud.google.com/security/secret-manager?project=mybody-dev-env):
+   - Имя: например **`garmin-email`**, значение — твой email.
+   - Имя: например **`garmin-password`**, значение — пароль от Garmin Connect.
+
+2. **Подключить к сервису Cloud Run**  
+   [Cloud Run → сервис mybody → Edit & deploy new revision](https://console.cloud.google.com/run?project=mybody-dev-env):
+   - Вкладка **Variables & Secrets** → **Add variable**:
+     - **GARMIN_EMAIL** → выбери **Reference a secret** → секрет `garmin-email`, версия `latest`.
+     - **GARMIN_PASSWORD** → **Reference a secret** → секрет `garmin-password`, версия `latest`.
+   - При необходимости добавь **CRON_SECRET** так же через Reference a secret.
+   - Нажми **Deploy**.
+
+   **Либо** задать секреты из кода: в [.github/workflows/deploy.yml](.github/workflows/deploy.yml) при деплое уже прописано `--set-secrets=GARMIN_EMAIL=garmin-email:latest,GARMIN_PASSWORD=garmin-password:latest` — при каждой пересборке эти переменные подхватываются из Secret Manager. Имена секретов в GCP должны совпадать: `garmin-email`, `garmin-password`.
+
+3. **Права доступа**  
+   Сервисный аккаунт Cloud Run (по умолчанию `PROJECT_NUMBER-compute@developer.gserviceaccount.com`) должен иметь роль **Secret Manager Secret Accessor** на секреты `garmin-email` и `garmin-password`. [IAM → выдать роль](https://console.cloud.google.com/iam-admin/iam?project=mybody-dev-env) или в карточке каждого секрета → **Permissions** → Add principal → этот аккаунт, роль Secret Manager Secret Accessor.
+
+После деплоя сервис будет читать логин и пароль из Secret Manager; в логах и конфигурации значения видны не будут.
+
+### Эндпоинты
+
+- **GET /garmin/status** — проверка, заданы ли учётные данные (без логина в Garmin).
+- **POST /internal/garmin-fetch?days=1** — загрузка данных за последние `days` дней. Если задан **CRON_SECRET**, в запросе обязателен заголовок **`X-Cron-Secret`** с тем же значением.
+
+Для ежедневной выгрузки настройте **Cloud Scheduler**: HTTP-запрос на `https://YOUR_SERVICE_URL/internal/garmin-fetch?days=1` с заголовком `X-Cron-Secret: <CRON_SECRET>`.
 
 ## Дальнейшие шаги
 
