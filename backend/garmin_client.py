@@ -77,12 +77,84 @@ def fetch_recent_data(days: int = 1) -> dict[str, Any]:
             except Exception:
                 pass
 
+        # Длительность сна как на странице Sleep (get_sleep_data → sleepTimeSeconds)
+        sleep_duration_by_day: dict[str, int] = {}
+        for day_str in list(stats_by_day.keys()):
+            try:
+                sleep_data = api.get_sleep_data(day_str)
+                if isinstance(sleep_data, dict):
+                    dto = sleep_data.get("dailySleepDTO") or sleep_data
+                    sec = dto.get("sleepTimeSeconds") if isinstance(dto, dict) else None
+                    if sec is not None:
+                        sleep_duration_by_day[day_str] = int(sec)
+            except Exception:
+                pass
+
         return {
             "ok": True,
             "from": start.isoformat(),
             "to": end.isoformat(),
             "activities": activity_list,
             "stats_by_day": stats_by_day,
+            "sleep_duration_by_day": sleep_duration_by_day,
         }
     except Exception as e:
         return {"ok": False, "error": str(e), "data": None}
+
+
+def _seconds_to_hours_min(seconds: int | float | None) -> str:
+    if seconds is None:
+        return "—"
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h > 0:
+        return f"{h}ч {m}мин"
+    return f"{m}мин"
+
+
+def build_readable_summary(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Превращает сырой ответ fetch_recent_data в удобочитаемую сводку по дням.
+    """
+    if not raw.get("ok") or not raw.get("stats_by_day"):
+        return {"ok": raw.get("ok", False), "error": raw.get("error"), "days": []}
+
+    sleep_by_day = raw.get("sleep_duration_by_day") or {}
+    days_summary = []
+    for date_str in sorted(raw["stats_by_day"].keys(), reverse=True):
+        s = raw["stats_by_day"][date_str]
+        steps = s.get("totalSteps")
+        goal = s.get("dailyStepGoal")
+        steps_str = f"{steps:,}".replace(",", " ") if steps is not None else "—"
+        goal_str = f"{goal:,}".replace(",", " ") if goal is not None else "—"
+        steps_with_goal = f"{steps_str} / {goal_str}" if (steps is not None and goal is not None) else steps_str
+
+        # Длительность сна: приоритет — get_sleep_data (как на странице Sleep), иначе — из get_stats
+        sleep_sec = sleep_by_day.get(date_str) or s.get("sleepingSeconds") or s.get("measurableAsleepDuration")
+        days_summary.append({
+            "date": date_str,
+            "steps": steps_with_goal,
+            "steps_value": steps,
+            "step_goal": goal,
+            "sleep": _seconds_to_hours_min(sleep_sec),
+            "sleep_seconds": sleep_sec,
+            "calories_total": int(s["totalKilocalories"]) if s.get("totalKilocalories") is not None else None,
+            "calories_active": int(s["activeKilocalories"]) if s.get("activeKilocalories") is not None else None,
+            "distance_km": round((s.get("totalDistanceMeters") or 0) / 1000, 2) if s.get("totalDistanceMeters") else None,
+            "stress": s.get("stressQualifier") or "—",
+            "stress_avg": s.get("averageStressLevel"),
+            "body_battery": f"{s.get('bodyBatteryAtWakeTime', '—')} → {s.get('bodyBatteryMostRecentValue', '—')}" if s.get("bodyBatteryAtWakeTime") is not None else "—",
+            "body_battery_wake": s.get("bodyBatteryAtWakeTime"),
+            "body_battery_end": s.get("bodyBatteryMostRecentValue"),
+            "resting_hr": s.get("restingHeartRate"),
+            "floors": int(s.get("floorsAscended") or 0) if s.get("floorsAscended") is not None else None,
+        })
+
+    return {
+        "ok": True,
+        "from": raw.get("from"),
+        "to": raw.get("to"),
+        "activities_count": len(raw.get("activities") or []),
+        "days": days_summary,
+    }

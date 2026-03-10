@@ -156,7 +156,8 @@ API: <http://localhost:8000>
 ### Эндпоинты
 
 - **GET /garmin/status** — проверка, заданы ли учётные данные (без логина в Garmin).
-- **POST /internal/garmin-fetch?days=1** — загрузка данных за последние `days` дней. Если задан **CRON_SECRET**, в запросе обязателен заголовок **`X-Cron-Secret`** с тем же значением.
+- **GET /garmin/data?days=7** — данные за последние дни: активности и статистика по дням (удобно открыть в браузере и посмотреть, что приходит из Garmin). Параметр `days` от 1 до 31.
+- **POST /internal/garmin-fetch?days=1** — то же для вызова по расписанию. Если задан **CRON_SECRET**, в запросе обязателен заголовок **`X-Cron-Secret`** с тем же значением.
 
 Для ежедневной выгрузки настройте **Cloud Scheduler**: HTTP-запрос на `https://YOUR_SERVICE_URL/internal/garmin-fetch?days=1` с заголовком `X-Cron-Secret: <CRON_SECRET>`.
 

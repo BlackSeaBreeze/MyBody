@@ -6,6 +6,7 @@ import os
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 from backend import garmin_client
 
@@ -42,6 +43,114 @@ def garmin_status():
     email = os.environ.get("GARMIN_EMAIL", "").strip()
     configured = bool(email and os.environ.get("GARMIN_PASSWORD", "").strip())
     return {"garmin_configured": configured}
+
+
+@app.get("/garmin/data")
+def garmin_data(days: int = 7):
+    """
+    Возвращает данные из Garmin Connect за последние days дней (по умолчанию 7).
+    Удобно открыть в браузере и посмотреть, что приходит: активности и статистика по дням.
+    """
+    data = garmin_client.fetch_recent_data(days=min(max(1, days), 31))
+    return data
+
+
+@app.get("/garmin/summary")
+def garmin_summary(days: int = 7):
+    """Удобочитаемая сводка по дням: шаги, сон, калории, стресс, Body Battery, пульс."""
+    raw = garmin_client.fetch_recent_data(days=min(max(1, days), 31))
+    return garmin_client.build_readable_summary(raw)
+
+
+@app.get("/garmin/view", response_class=HTMLResponse)
+def garmin_view(days: int = 7):
+    """Страница с таблицей: данные Garmin по дням в удобочитаемом виде."""
+    raw = garmin_client.fetch_recent_data(days=min(max(1, days), 31))
+    summary = garmin_client.build_readable_summary(raw)
+    if not summary.get("ok") or not summary.get("days"):
+        return _garmin_view_html(
+            error=summary.get("error", "Нет данных или Garmin не настроен"),
+            days_list=[],
+            period=None,
+        )
+    return _garmin_view_html(
+        error=None,
+        days_list=summary["days"],
+        period=(summary.get("from"), summary.get("to")),
+    )
+
+
+def _garmin_view_html(
+    *,
+    error: str | None,
+    days_list: list[dict],
+    period: tuple[str | None, str | None] | None,
+) -> str:
+    period_str = f"{period[0]} — {period[1]}" if period and period[0] and period[1] else ""
+    rows = ""
+    for d in days_list:
+        steps = d.get("steps") or "—"
+        sleep = d.get("sleep") or "—"
+        cal = d.get("calories_total")
+        cal_str = str(cal) if cal is not None else "—"
+        stress = d.get("stress") or "—"
+        bb = d.get("body_battery") or "—"
+        hr = d.get("resting_hr")
+        hr_str = str(hr) if hr is not None else "—"
+        dist = d.get("distance_km")
+        dist_str = f"{dist} км" if dist is not None else "—"
+        rows += f"""
+        <tr>
+            <td><strong>{d.get('date', '')}</strong></td>
+            <td>{steps}</td>
+            <td>{sleep}</td>
+            <td>{cal_str}</td>
+            <td>{dist_str}</td>
+            <td>{stress}</td>
+            <td>{bb}</td>
+            <td>{hr_str}</td>
+        </tr>"""
+    table = f"""
+    <table>
+        <thead>
+            <tr>
+                <th>Дата</th>
+                <th>Шаги / цель</th>
+                <th>Сон</th>
+                <th>Ккал</th>
+                <th>Расстояние</th>
+                <th>Стресс</th>
+                <th>Body Battery</th>
+                <th>Пульс покоя</th>
+            </tr>
+        </thead>
+        <tbody>{rows}
+        </tbody>
+    </table>""" if days_list else "<p>Нет данных за период.</p>"
+    err_block = f'<p class="error">{error}</p>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>MyBody — Garmin</title>
+    <style>
+        body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #1a1a1a; color: #e0e0e0; }}
+        h1 {{ font-size: 1.5rem; }}
+        .period {{ color: #888; margin-bottom: 1rem; }}
+        .error {{ color: #e88; }}
+        table {{ border-collapse: collapse; width: 100%; max-width: 900px; }}
+        th, td {{ border: 1px solid #444; padding: 0.5rem 0.75rem; text-align: left; }}
+        th {{ background: #333; }}
+        tr:nth-child(even) {{ background: #252525; }}
+    </style>
+</head>
+<body>
+    <h1>Данные Garmin</h1>
+    <p class="period">{period_str}</p>
+    {err_block}
+    {table}
+</body>
+</html>"""
 
 
 @app.post("/internal/garmin-fetch")
