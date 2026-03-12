@@ -66,13 +66,13 @@ SYSTEM_PROMPT = """Ты — персональный помощник по зд�
 Формат ответа: на русском языке, структурированно (короткие абзацы или списки), без лишнего вступления. Не придумывай данные — опирайся только на переданные метрики."""
 
 
-def analyze_garmin_metrics(metrics: dict[str, Any], model: str = "gemini-3.1-pro-preview") -> dict[str, Any]:
+def analyze_garmin_metrics(metrics: dict[str, Any], model: str = "gemini-1.5-flash") -> dict[str, Any]:
     """
     Отправляет данные Garmin в Gemini и возвращает анализ и рекомендации.
 
     :param metrics: результат garmin_client.fetch_all_metrics(days=...)
-    :param model: имя модели. По умолчанию gemini-3.1-pro-preview (наиболее мощная).
-                  Варианты: gemini-1.5-pro, gemini-1.5-flash (быстрее/дешевле).
+    :param model: имя модели. По умолчанию gemini-1.5-flash (есть бесплатная квота в API).
+                  Для большей глубины: gemini-1.5-pro. Gemini 3.1 требует платный биллинг API.
     :return: {"ok": True, "analysis": "текст от модели"} или {"ok": False, "error": "..."}
     """
     if genai is None:
