@@ -169,7 +169,7 @@ def _garmin_view_html(
 
 
 @app.get("/garmin/analyze")
-def garmin_analyze(days: int = 7, model: str = "gemini-1.5-flash"):
+def garmin_analyze(days: int = 7, model: str = "gemini-2.0-flash"):
     """
     Загружает полные метрики Garmin за последние days дней, отправляет их в Gemini
     и возвращает текстовый анализ и рекомендации по здоровью и активности.
