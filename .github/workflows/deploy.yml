@@ -61,6 +61,6 @@ jobs:
             --region ${{ env.REGION }} \
             --platform managed \
             --allow-unauthenticated \
-            --set-secrets=GARMIN_EMAIL=garmin-email:latest,GARMIN_PASSWORD=garmin-password:latest
+            --set-secrets=GARMIN_EMAIL=garmin-email:latest,GARMIN_PASSWORD=garmin-password:latest,GEMINI_API_KEY=gemini-api-key:latest
         env:
           CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}

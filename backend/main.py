@@ -4,11 +4,15 @@ MyBody — бэкенд: ежедневные рекомендации и чат
 """
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from backend import garmin_client
+from backend import garmin_client, gemini_client
 
 app = FastAPI(
     title="MyBody API",
@@ -52,6 +56,17 @@ def garmin_data(days: int = 7):
     Удобно открыть в браузере и посмотреть, что приходит: активности и статистика по дням.
     """
     data = garmin_client.fetch_recent_data(days=min(max(1, days), 31))
+    return data
+
+
+@app.get("/garmin/metrics")
+def garmin_metrics(days: int = 7):
+    """
+    Все доступные метрики Garmin за последние days дней: stats, sleep, heart_rates,
+    stress, body_battery, hydration, respiration, SpO2, HRV, training_readiness и др.
+    Структура metrics_by_day[date] готова для передачи в Gemini как контекст.
+    """
+    data = garmin_client.fetch_all_metrics(days=min(max(1, days), 31))
     return data
 
 
@@ -151,6 +166,18 @@ def _garmin_view_html(
     {table}
 </body>
 </html>"""
+
+
+@app.get("/garmin/analyze")
+def garmin_analyze(days: int = 7, model: str = "gemini-3.1-pro-preview"):
+    """
+    Загружает полные метрики Garmin за последние days дней, отправляет их в Gemini
+    и возвращает текстовый анализ и рекомендации по здоровью и активности.
+    Требуется переменная окружения GEMINI_API_KEY (ключ из Google AI Studio).
+    """
+    metrics = garmin_client.fetch_all_metrics(days=min(max(1, days), 31))
+    result = gemini_client.analyze_garmin_metrics(metrics, model=model)
+    return result
 
 
 @app.post("/internal/garmin-fetch")

@@ -156,10 +156,101 @@ API: <http://localhost:8000>
 ### Эндпоинты
 
 - **GET /garmin/status** — проверка, заданы ли учётные данные (без логина в Garmin).
-- **GET /garmin/data?days=7** — данные за последние дни: активности и статистика по дням (удобно открыть в браузере и посмотреть, что приходит из Garmin). Параметр `days` от 1 до 31.
+- **GET /garmin/data?days=7** — данные за последние дни: активности и статистика по дням. Параметр `days` от 1 до 31.
+- **GET /garmin/metrics?days=7** — **все доступные метрики** за период (stats, sleep, heart_rates, stress, body_battery, hydration, respiration, SpO2, HRV, training_readiness и др.) в виде `metrics_by_day[date]` — готовый контекст для Gemini.
+- **GET /garmin/summary?days=7** — удобочитаемая сводка по дням (JSON).
+- **GET /garmin/view?days=7** — страница с таблицей по дням.
+- **GET /garmin/analyze?days=7** — анализ данных Garmin через **Gemini**: загружаются метрики за период, отправляются в модель, возвращается текст с выводами и рекомендациями. Параметр `model` (по умолчанию **gemini-3.1-pro-preview**), опционально `days` (1–31). Требуется **GEMINI_API_KEY** (см. раздел Gemini ниже).
 - **POST /internal/garmin-fetch?days=1** — то же для вызова по расписанию. Если задан **CRON_SECRET**, в запросе обязателен заголовок **`X-Cron-Secret`** с тем же значением.
 
 Для ежедневной выгрузки настройте **Cloud Scheduler**: HTTP-запрос на `https://YOUR_SERVICE_URL/internal/garmin-fetch?days=1` с заголовком `X-Cron-Secret: <CRON_SECRET>`.
+
+### Методы Garmin API (GET /garmin/metrics)
+
+Список всех методов библиотеки [garminconnect](https://pypi.org/project/garminconnect/), которые вызываются для сбора метрик. Результаты попадают в `metrics_by_day`, `range_metrics`, `global_metrics` и `activities`.
+
+**По каждому дню** (результат в `metrics_by_day[date]`):
+
+| Метод | Описание (кратко) |
+|-------|-------------------|
+| `get_stats` | Сводка дня (шаги, калории, сон, стресс, Body Battery, пульс и т.д.) |
+| `get_user_summary` | Дневная сводка пользователя |
+| `get_steps_data` | Данные по шагам за день |
+| `get_floors` | Этажи (подъёмы/спуски) |
+| `get_heart_rates` | Пульс в течение дня |
+| `get_sleep_data` | Сон (длительность, стадии — как на странице Sleep) |
+| `get_body_composition` | Состав тела за день |
+| `get_hydration_data` | Гидратация |
+| `get_respiration_data` | Дыхание |
+| `get_spo2_data` | SpO₂ |
+| `get_intensity_minutes_data` | Минуты интенсивности |
+| `get_all_day_stress` | Стресс за день |
+| `get_stress_data` | Данные по стрессу |
+| `get_rhr_day` | Пульс покоя за день |
+| `get_hrv_data` | HRV (вариабельность пульса) |
+| `get_training_readiness` | Готовность к тренировке |
+| `get_morning_training_readiness` | Утренняя готовность к тренировке |
+| `get_training_status` | Статус тренировок |
+| `get_fitnessage_data` | Fitness Age |
+| `get_lifestyle_logging_data` | Логирование образа жизни |
+| `get_daily_weigh_ins` | Взвешивания за день |
+| `get_body_battery` | Body Battery за день |
+| `get_stats_and_body` | Сводка дня + состав тела |
+| `get_body_battery_events` | События Body Battery |
+| `get_max_metrics` | Пиковые метрики за день |
+| `get_all_day_events` | События за день |
+| `get_activities_fordate` | Активности за эту дату |
+| `get_menstrual_data_for_date` | Данные цикла за дату (если есть) |
+
+**За период** (один вызов на запрошенный диапазон, результат в `range_metrics`):
+
+| Метод | Описание |
+|-------|----------|
+| `get_daily_steps` | Шаги по дням за период |
+| `get_weigh_ins` | Взвешивания за период |
+| `get_blood_pressure` | Давление по дням |
+| `get_endurance_score` | Показатель выносливости |
+| `get_hill_score` | Показатель по подъёмам |
+| `get_race_predictions` | Прогнозы времени на дистанции |
+| `get_weekly_intensity_minutes` | Минуты интенсивности по неделям |
+
+**Глобальные** (один вызов без даты, результат в `global_metrics`):
+
+| Метод | Описание |
+|-------|----------|
+| `get_user_profile` | Профиль пользователя |
+| `get_goals` | Цели (активные) |
+| `get_personal_record` | Личные рекорды |
+| `get_lactate_threshold` | Лактатный порог (последний) |
+
+**Активности за период** (отдельно в `activities`):
+
+| Метод | Описание |
+|-------|----------|
+| `get_activities_by_date` | Список активностей за период (полные объекты) |
+
+Если какой-то метод по дате или за период вернул ошибку или пустой результат, он не попадает в ответ (остальные данные возвращаются).
+
+## Gemini (анализ данных)
+
+Для эндпоинта **GET /garmin/analyze** используется Google Gemini: данные Garmin за выбранный период отправляются в модель, которая возвращает краткий анализ и рекомендации (сон, активность, стресс, восстановление).
+
+По умолчанию используется модель **gemini-3.1-pro-preview** (наиболее мощная). Можно передать параметр `model`: например, `gemini-1.5-pro`, `gemini-1.5-flash` (быстрее и дешевле).
+
+### Где хранить API-ключ
+
+| Окружение | Где хранить | Как |
+|-----------|-------------|-----|
+| **Локальная разработка** | Файл **`.env`** в корне проекта | Скопируйте [.env.example](.env.example) в `.env`, подставьте `GEMINI_API_KEY=...`. При запуске приложение подхватывает переменные из `.env` (файл в `.gitignore`, в репозиторий не попадает). |
+| **Cloud Run (прод)** | **Secret Manager** в GCP | Создайте секрет `gemini-api-key` со значением ключа (например, `projects/401681859743/secrets/gemini-api-key`). При деплое через GitHub Actions переменная **GEMINI_API_KEY** уже подхватывается из этого секрета ([deploy.yml](.github/workflows/deploy.yml): `--set-secrets=...,GEMINI_API_KEY=gemini-api-key:latest`). У сервисного аккаунта Cloud Run должна быть роль **Secret Manager Secret Accessor** на секрет `gemini-api-key`. |
+
+Не храните ключ в коде и не коммитьте `.env` в git.
+
+### Переменные окружения
+
+| Переменная | Описание |
+|------------|----------|
+| `GEMINI_API_KEY` | API-ключ из [Google AI Studio](https://aistudio.google.com/apikey) (бесплатный tier доступен) |
 
 ## Дальнейшие шаги
 

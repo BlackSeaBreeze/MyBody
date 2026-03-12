@@ -102,6 +102,175 @@ def fetch_recent_data(days: int = 1) -> dict[str, Any]:
         return {"ok": False, "error": str(e), "data": None}
 
 
+# Список методов API, возвращающих дневные метрики (один аргумент — date YYYY-MM-DD).
+# Все результаты попадут в metrics_by_day[date][key] для передачи в Gemini.
+_DAILY_METRIC_METHODS = (
+    "get_stats",
+    "get_user_summary",
+    "get_steps_data",
+    "get_floors",
+    "get_heart_rates",
+    "get_sleep_data",
+    "get_body_composition",
+    "get_hydration_data",
+    "get_respiration_data",
+    "get_spo2_data",
+    "get_intensity_minutes_data",
+    "get_all_day_stress",
+    "get_stress_data",
+    "get_rhr_day",
+    "get_hrv_data",
+    "get_training_readiness",
+    "get_morning_training_readiness",
+    "get_training_status",
+    "get_fitnessage_data",
+    "get_lifestyle_logging_data",
+    "get_daily_weigh_ins",
+    "get_body_battery",
+    # Дополнительные дневные
+    "get_stats_and_body",
+    "get_body_battery_events",
+    "get_max_metrics",
+    "get_all_day_events",
+    "get_activities_fordate",
+    "get_menstrual_data_for_date",
+)
+
+# Методы с диапазоном (start, end): вызываются один раз за период, результат в range_metrics.
+_RANGE_METRIC_METHODS = (
+    "get_daily_steps",
+    "get_weigh_ins",
+    "get_blood_pressure",
+    "get_endurance_score",
+    "get_hill_score",
+    "get_race_predictions",
+    "get_weekly_intensity_minutes",
+)
+
+# Методы без даты: один вызов, результат в global_metrics.
+_GLOBAL_METRIC_METHODS = (
+    "get_user_profile",
+    "get_goals",
+    "get_personal_record",
+)
+
+
+def fetch_all_metrics(days: int = 7) -> dict[str, Any]:
+    """
+    Загружает все доступные метрики Garmin за последние days дней.
+    Для каждого дня вызываются все дневные API (stats, sleep, heart rate, stress, body battery,
+    hydration, respiration, SpO2, HRV, training readiness и т.д.).
+    Результат готов для передачи в Gemini как полный контекст.
+    """
+    api = get_client()
+    if api is None:
+        return {"ok": False, "error": "garmin_not_configured", "metrics_by_day": None}
+
+    try:
+        end = datetime.now().date()
+        start = end - timedelta(days=days)
+        day_count = (end - start).days + 1
+
+        # Активности за период
+        activity_list: list[dict[str, Any]] = []
+        try:
+            activities = api.get_activities_by_date(
+                startdate=start.isoformat(),
+                enddate=end.isoformat(),
+            )
+            if isinstance(activities, list):
+                for a in activities:
+                    activity_list.append(dict(a))  # полный объект для Gemini
+        except Exception:
+            pass
+
+        # Все дневные метрики по дням
+        metrics_by_day: dict[str, dict[str, Any]] = {}
+        for d in range(day_count):
+            day = start + timedelta(days=d)
+            day_str = day.isoformat()
+            metrics_by_day[day_str] = {}
+
+            for method_name in _DAILY_METRIC_METHODS:
+                method = getattr(api, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    # методы с (startdate, enddate) вызываем с одним днём
+                    if method_name in ("get_body_composition", "get_body_battery"):
+                        result = method(day_str, day_str)
+                    else:
+                        result = method(day_str)
+                    if result is not None:
+                        key = method_name.replace("get_", "", 1)
+                        if isinstance(result, dict):
+                            metrics_by_day[day_str][key] = result
+                        elif isinstance(result, list):
+                            metrics_by_day[day_str][key] = result
+                        else:
+                            metrics_by_day[day_str][key] = result
+                except Exception:
+                    pass
+
+        # Методы с диапазоном дат: один вызов на весь период
+        start_str = start.isoformat()
+        end_str = end.isoformat()
+        range_metrics: dict[str, Any] = {}
+        for method_name in _RANGE_METRIC_METHODS:
+            method = getattr(api, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                if method_name == "get_race_predictions":
+                    result = method(startdate=start_str, enddate=end_str)
+                else:
+                    result = method(start_str, end_str)
+                if result is not None:
+                    key = method_name.replace("get_", "", 1)
+                    range_metrics[key] = result
+            except Exception:
+                pass
+
+        # Глобальные методы (без даты): один вызов
+        global_metrics: dict[str, Any] = {}
+        for method_name in _GLOBAL_METRIC_METHODS:
+            method = getattr(api, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                if method_name == "get_goals":
+                    result = method("active", 0, 30)
+                else:
+                    result = method()
+                if result is not None:
+                    key = method_name.replace("get_", "", 1)
+                    global_metrics[key] = result
+            except Exception:
+                pass
+
+        # Лактатный порог (спец. сигнатура: latest=True)
+        try:
+            lt = getattr(api, "get_lactate_threshold", None)
+            if callable(lt):
+                result = lt(latest=True)
+                if result is not None:
+                    global_metrics["lactate_threshold"] = result
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "from": start.isoformat(),
+            "to": end.isoformat(),
+            "activities": activity_list,
+            "metrics_by_day": metrics_by_day,
+            "range_metrics": range_metrics,
+            "global_metrics": global_metrics,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "metrics_by_day": None}
+
+
 def _seconds_to_hours_min(seconds: int | float | None) -> str:
     if seconds is None:
         return "—"
