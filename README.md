@@ -160,7 +160,7 @@ API: <http://localhost:8000>
 - **GET /garmin/metrics?days=7** — **все доступные метрики** за период (stats, sleep, heart_rates, stress, body_battery, hydration, respiration, SpO2, HRV, training_readiness и др.) в виде `metrics_by_day[date]` — готовый контекст для Gemini.
 - **GET /garmin/summary?days=7** — удобочитаемая сводка по дням (JSON).
 - **GET /garmin/view?days=7** — страница с таблицей по дням.
-- **GET /garmin/analyze?days=7** — анализ данных Garmin через **Gemini**: загружаются метрики за период, отправляются в модель, возвращается текст с выводами и рекомендациями. Параметр `model` (по умолчанию **gemini-2.0-flash**), опционально `days` (1–31). Требуется **GEMINI_API_KEY** (см. раздел Gemini ниже).
+- **GET /garmin/analyze?days=7** — анализ данных Garmin через **Gemini**: загружаются метрики за период, отправляются в модель, возвращается текст с выводами и рекомендациями. Параметр `model` (по умолчанию **gemini-3-flash-preview**), опционально `days` (1–31). Требуется **GEMINI_API_KEY** (см. раздел Gemini ниже).
 - **POST /internal/garmin-fetch?days=1** — то же для вызова по расписанию. Если задан **CRON_SECRET**, в запросе обязателен заголовок **`X-Cron-Secret`** с тем же значением.
 
 Для ежедневной выгрузки настройте **Cloud Scheduler**: HTTP-запрос на `https://YOUR_SERVICE_URL/internal/garmin-fetch?days=1` с заголовком `X-Cron-Secret: <CRON_SECRET>`.
@@ -235,7 +235,7 @@ API: <http://localhost:8000>
 
 Для эндпоинта **GET /garmin/analyze** используется Google Gemini: данные Garmin за выбранный период отправляются в модель, которая возвращает краткий анализ и рекомендации (сон, активность, стресс, восстановление).
 
-По умолчанию используется модель **gemini-2.0-flash** (актуальный ID в API). Если получаете 404, проверьте доступные модели: `https://generativelanguage.googleapis.com/v1beta/models?key=ВАШ_API_KEY`. При 429 (квота) попробуйте другую модель через параметр `model=...`. Подписка Google One Premium к квотам Gemini API не относится.
+По умолчанию используется модель **gemini-3-flash-preview** (семейство Gemini 3). Для максимальной глубины анализа можно передать `model=gemini-3.1-pro-preview`. Список моделей: `https://generativelanguage.googleapis.com/v1beta/models?key=ВАШ_API_KEY`. Для платных моделей нужен включённый биллинг в [Google AI Studio](https://aistudio.google.com).
 
 ### Где хранить API-ключ
 

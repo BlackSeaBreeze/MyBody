@@ -10,9 +10,11 @@ import os
 from typing import Any
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 except ImportError:
     genai = None  # type: ignore
+    types = None  # type: ignore
 
 
 def is_configured() -> bool:
@@ -66,16 +68,16 @@ SYSTEM_PROMPT = """Ты — персональный помощник по зд�
 Формат ответа: на русском языке, структурированно (короткие абзацы или списки), без лишнего вступления. Не придумывай данные — опирайся только на переданные метрики."""
 
 
-def analyze_garmin_metrics(metrics: dict[str, Any], model: str = "gemini-2.0-flash") -> dict[str, Any]:
+def analyze_garmin_metrics(metrics: dict[str, Any], model: str = "gemini-3-flash-preview") -> dict[str, Any]:
     """
     Отправляет данные Garmin в Gemini и возвращает анализ и рекомендации.
 
     :param metrics: результат garmin_client.fetch_all_metrics(days=...)
-    :param model: имя модели. По умолчанию gemini-2.0-flash (актуальный ID в API v1beta).
-                  Варианты: gemini-2.5-flash, gemini-1.5-pro. Список: GET https://generativelanguage.googleapis.com/v1beta/models?key=API_KEY
+    :param model: имя модели. По умолчанию gemini-3-flash-preview (семейство Gemini 3).
+                  Варианты: gemini-3.1-pro-preview (максимум возможностей), gemini-2.0-flash.
     :return: {"ok": True, "analysis": "текст от модели"} или {"ok": False, "error": "..."}
     """
-    if genai is None:
+    if genai is None or types is None:
         return {"ok": False, "error": "gemini_sdk_not_installed", "analysis": None}
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -96,16 +98,16 @@ def analyze_garmin_metrics(metrics: dict[str, Any], model: str = "gemini-2.0-fla
     )
 
     try:
-        genai.configure(api_key=api_key)
-        gemini_model = genai.GenerativeModel(
-            model,
-            system_instruction=SYSTEM_PROMPT,
-            generation_config=genai.types.GenerationConfig(
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
                 temperature=0.4,
             ),
         )
-        response = gemini_model.generate_content(user_content)
-        if not response or not response.text:
+        if not response or not getattr(response, "text", None):
             return {"ok": False, "error": "empty_gemini_response", "analysis": None}
         return {"ok": True, "analysis": response.text.strip(), "model": model}
     except Exception as e:

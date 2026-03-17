@@ -10,7 +10,7 @@ load_dotenv()
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from backend import garmin_client, gemini_client
 
@@ -37,6 +37,12 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """Пустой ответ для favicon — браузеры запрашивают его автоматически."""
+    return Response(status_code=204)
 
 
 # --- Garmin ---
@@ -169,7 +175,7 @@ def _garmin_view_html(
 
 
 @app.get("/garmin/analyze")
-def garmin_analyze(days: int = 7, model: str = "gemini-2.0-flash"):
+def garmin_analyze(days: int = 7, model: str = "gemini-3-flash-preview"):
     """
     Загружает полные метрики Garmin за последние days дней, отправляет их в Gemini
     и возвращает текстовый анализ и рекомендации по здоровью и активности.
