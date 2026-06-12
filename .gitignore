@@ -19,6 +19,7 @@ env/
 # Env and secrets
 .env
 .env.local
+.garmin-tokens/
 *.pem
 *-key.json
 !*-key.json.example

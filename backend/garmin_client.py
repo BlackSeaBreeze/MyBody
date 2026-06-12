@@ -6,29 +6,93 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 # Ленивый импорт: garminconnect ставится опционально для окружений без Garmin
 try:
     from garminconnect import Garmin
+    from garminconnect import (
+        GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
+        GarminConnectTooManyRequestsError,
+    )
 except ImportError:
     Garmin = None  # type: ignore
+    GarminConnectAuthenticationError = type("GarminConnectAuthenticationError", (Exception,), {})  # type: ignore
+    GarminConnectConnectionError = type("GarminConnectConnectionError", (Exception,), {})  # type: ignore
+    GarminConnectTooManyRequestsError = type("GarminConnectTooManyRequestsError", (Exception,), {})  # type: ignore
 
 
-def get_client() -> Any:
-    """Создаёт и логинит клиент Garmin. Возвращает None, если креды не заданы или ошибка."""
+def _garmin_tokenstore_dir() -> Path:
+    """Каталог с oauth1/oauth2 JSON (переменная GARMINTOKENS или .garmin-tokens в корне проекта)."""
+    custom = os.environ.get("GARMINTOKENS", "").strip()
+    if custom:
+        return Path(custom).expanduser().resolve()
+    return (Path(__file__).resolve().parent.parent / ".garmin-tokens").resolve()
+
+
+def _garmin_tokens_on_disk(store: Path) -> bool:
+    """Файлы сессии: garminconnect 0.3+ (garmin_tokens.json) или старый garth (oauth*.json)."""
+    if not store.is_dir():
+        return False
+    if (store / "garmin_tokens.json").is_file():
+        return True
+    return (store / "oauth1_token.json").is_file() and (store / "oauth2_token.json").is_file()
+
+
+def _err_detail(exc: BaseException, max_len: int = 800) -> str:
+    s = str(exc).strip()
+    if len(s) > max_len:
+        return s[: max_len - 3] + "..."
+    return s
+
+
+def get_client() -> tuple[Any | None, str | None, str | None]:
+    """
+    Создаёт и логинит клиент Garmin.
+    Успех: (api, None, None). Ошибка: (None, код, detail) — detail для отладки (текст исключения).
+    """
     if Garmin is None:
-        return None
+        return None, "garmin_sdk_missing", "garminconnect not installed"
     email = os.environ.get("GARMIN_EMAIL", "").strip()
     password = os.environ.get("GARMIN_PASSWORD", "").strip()
     if not email or not password:
-        return None
+        return None, "garmin_not_configured", "GARMIN_EMAIL / GARMIN_PASSWORD missing"
+    store = _garmin_tokenstore_dir()
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
     try:
         api = Garmin(email, password)
-        api.login()
-        return api
-    except Exception:
-        return None
+        # Всегда передаём каталог: garminconnect 0.3+ сам грузит/сохраняет garmin_tokens.json
+        # и после успешного парольного входа вызывает client.dump (повторный SSO реже нужен).
+        api.login(tokenstore=str(store))
+        # garminconnect < 0.3 (garth): дополнительно сохранить oauth-файлы, если есть .garth
+        if hasattr(api, "garth") and api.garth is not None:
+            try:
+                api.garth.dump(str(store))
+            except OSError:
+                pass
+        return api, None, None
+    except GarminConnectTooManyRequestsError as e:
+        return None, "garmin_rate_limited", _err_detail(e)
+    except GarminConnectAuthenticationError as e:
+        # garminconnect 0.3 иногда заворачивает 429 в AuthenticationError (см. portal login).
+        err_low = str(e).lower()
+        if "429" in err_low or "rate limit" in err_low:
+            return None, "garmin_rate_limited", _err_detail(e)
+        # Неверный пароль, MFA без prompt_mfa, пустой профиль и т.д.
+        return None, "garmin_auth_failed", _err_detail(e)
+    except GarminConnectConnectionError as e:
+        err_low = str(e).lower()
+        if "429" in err_low or "too many requests" in err_low:
+            return None, "garmin_rate_limited", _err_detail(e)
+        return None, "garmin_login_failed", _err_detail(e)
+    except Exception as e:
+        return None, "garmin_login_failed", _err_detail(e)
 
 
 def fetch_recent_data(days: int = 1) -> dict[str, Any]:
@@ -36,9 +100,22 @@ def fetch_recent_data(days: int = 1) -> dict[str, Any]:
     Загружает данные за последние days дней: активность и статистика.
     Возвращает словарь, готовый для передачи в агента/отчёт.
     """
-    api = get_client()
+    api, client_err, client_detail = get_client()
     if api is None:
-        return {"ok": False, "error": "garmin_not_configured", "data": None}
+        out: dict[str, Any] = {"ok": False, "error": client_err, "data": None}
+        if client_detail:
+            out["detail"] = client_detail
+        if client_err == "garmin_rate_limited":
+            out["hint"] = (
+                "Garmin SSO временно ограничил входы (429). Подождите 15–60 мин, "
+                "не жмите Execute подряд. После первого успешного входа сессия кэшируется в .garmin-tokens."
+            )
+        if client_err == "garmin_auth_failed" and client_detail and "MFA" in client_detail:
+            out["hint"] = (
+                "Аккаунт требует MFA. Для API без интерактива временно отключите MFA в настройках Garmin "
+                "или используйте официальный demo.py с prompt_mfa. См. README garminconnect."
+            )
+        return out
 
     try:
         end = datetime.now().date()
@@ -162,9 +239,26 @@ def fetch_all_metrics(days: int = 7) -> dict[str, Any]:
     hydration, respiration, SpO2, HRV, training readiness и т.д.).
     Результат готов для передачи в Gemini как полный контекст.
     """
-    api = get_client()
+    api, client_err, client_detail = get_client()
     if api is None:
-        return {"ok": False, "error": "garmin_not_configured", "metrics_by_day": None}
+        out: dict[str, Any] = {
+            "ok": False,
+            "error": client_err,
+            "metrics_by_day": None,
+        }
+        if client_detail:
+            out["detail"] = client_detail
+        if client_err == "garmin_rate_limited":
+            out["hint"] = (
+                "Garmin SSO временно ограничил входы (429). Подождите 15–60 мин, "
+                "не жмите Execute подряд. После первого успешного входа сессия кэшируется в .garmin-tokens."
+            )
+        if client_err == "garmin_auth_failed" and client_detail and "MFA" in client_detail:
+            out["hint"] = (
+                "Аккаунт требует MFA. Для API без интерактива временно отключите MFA в настройках Garmin "
+                "или используйте официальный demo.py с prompt_mfa. См. README garminconnect."
+            )
+        return out
 
     try:
         end = datetime.now().date()
