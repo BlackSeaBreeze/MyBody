@@ -291,6 +291,98 @@ def _list_folder_files(service, folder_id: str) -> list[dict[str, Any]]:
 
 _IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None  # type: ignore
+
+
+def _meals_fetch_limits() -> dict[str, int]:
+    def _int(name: str, default: int) -> int:
+        try:
+            return max(1, int(os.environ.get(name, str(default))))
+        except ValueError:
+            return default
+
+    return {
+        "max_photos": _int("DRIVE_MEALS_MAX_PHOTOS", 12),
+        "max_bytes_per_file": _int("DRIVE_MEALS_MAX_BYTES", 12_000_000),
+        "max_total_bytes": _int("DRIVE_MEALS_MAX_TOTAL_BYTES", 60_000_000),
+        "max_download_bytes": _int("DRIVE_MEALS_MAX_DOWNLOAD_BYTES", 20_000_000),
+        "compress_if_bytes": _int("MEALS_COMPRESS_IF_BYTES", 4_000_000),
+        "compress_soft_edge": _int("MEALS_COMPRESS_SOFT_EDGE", 2560),
+        "compress_soft_quality": _int("MEALS_COMPRESS_SOFT_QUALITY", 92),
+        "compress_hard_edge": _int("MEALS_COMPRESS_HARD_EDGE", 1920),
+        "compress_hard_quality": _int("MEALS_COMPRESS_HARD_QUALITY", 88),
+    }
+
+
+def _encode_meal_image(
+    data: bytes,
+    mime_type: str,
+    *,
+    max_edge: int,
+    quality: int,
+) -> tuple[bytes, str, int]:
+    """Сжимает фото только при необходимости (resize + JPEG)."""
+    if Image is None or not data:
+        return data, mime_type, len(data)
+    try:
+        import io
+
+        with Image.open(io.BytesIO(data)) as img:
+            img.load()
+            if max(img.size) > max_edge:
+                img = img.copy()
+                img.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            out = buf.getvalue()
+            return out, "image/jpeg", len(out)
+    except Exception:
+        return data, mime_type, len(data)
+
+
+def _prepare_meal_image(
+    data: bytes,
+    mime_type: str,
+    *,
+    limits: dict[str, int],
+    remaining_budget: int,
+    max_bytes_per_file: int,
+) -> tuple[bytes | None, str, int, str]:
+    """
+    Возвращает (bytes, mime, size, compression).
+    compression: none | soft | hard | skipped_too_large
+    По умолчанию (MEALS_IMAGE_COMPRESS=auto) оригинал сохраняется, если влезает в лимиты.
+    """
+    size = len(data)
+    mode = (os.environ.get("MEALS_IMAGE_COMPRESS") or "auto").strip().lower()
+
+    def fits(n: int) -> bool:
+        return n <= remaining_budget and n <= max_bytes_per_file
+
+    if mode == "never":
+        return (data, mime_type, size, "none") if fits(size) else (None, mime_type, size, "skipped_too_large")
+
+    if mode != "always" and fits(size) and size <= limits["compress_if_bytes"]:
+        return data, mime_type, size, "none"
+
+    last: tuple[bytes, str, int] = (data, mime_type, size)
+    for label, edge, quality in (
+        ("soft", limits["compress_soft_edge"], limits["compress_soft_quality"]),
+        ("hard", limits["compress_hard_edge"], limits["compress_hard_quality"]),
+    ):
+        last = _encode_meal_image(data, mime_type, max_edge=edge, quality=quality)
+        if fits(last[2]):
+            return last[0], last[1], last[2], label
+
+    if fits(last[2]):
+        return last[0], last[1], last[2], "hard"
+    return None, mime_type, last[2], "skipped_too_large"
+
 
 def download_file_bytes(file_id: str) -> dict[str, Any]:
     """Скачивает содержимое файла Drive."""
@@ -329,18 +421,26 @@ def download_file_bytes(file_id: str) -> dict[str, Any]:
 def fetch_day_meal_photos(
     day: str,
     *,
-    max_photos: int = 30,
-    max_bytes_per_file: int = 15_000_000,
+    max_photos: int | None = None,
+    max_bytes_per_file: int | None = None,
 ) -> dict[str, Any]:
     """
     Загружает фото еды из подпапки Meals/YYYY.MM.DD на Google Drive.
     Возвращает список фото с байтами для передачи в Gemini Vision.
+    По умолчанию фото не сжимаются; сжатие только если файл > MEALS_COMPRESS_IF_BYTES
+    или не влезает в DRIVE_MEALS_MAX_BYTES / DRIVE_MEALS_MAX_TOTAL_BYTES.
     """
     if build is None:
         return {"ok": False, "error": "drive_sdk_not_installed"}
     root_id = _meals_folder_id()
     if not root_id:
         return {"ok": False, "error": "drive_meals_folder_not_configured"}
+
+    limits = _meals_fetch_limits()
+    max_photos = max_photos if max_photos is not None else limits["max_photos"]
+    max_bytes_per_file = max_bytes_per_file if max_bytes_per_file is not None else limits["max_bytes_per_file"]
+    max_total_bytes = limits["max_total_bytes"]
+    max_download_bytes = limits["max_download_bytes"]
 
     folder_name = meals_subfolder_name(day)
     out: dict[str, Any] = {
@@ -350,6 +450,14 @@ def fetch_day_meal_photos(
         "meals_root_id": root_id,
         "photos": [],
         "skipped": [],
+        "limits": {
+            "max_photos": max_photos,
+            "max_bytes_per_file": max_bytes_per_file,
+            "max_total_bytes": max_total_bytes,
+            "max_download_bytes": max_download_bytes,
+            "compress_if_bytes": limits["compress_if_bytes"],
+            "compress_mode": (os.environ.get("MEALS_IMAGE_COMPRESS") or "auto").strip().lower(),
+        },
     }
 
     try:
@@ -372,13 +480,16 @@ def fetch_day_meal_photos(
         image_entries.sort(key=lambda f: f.get("createdTime") or f.get("name") or "")
 
         photos: list[dict[str, Any]] = []
+        total_bytes = 0
         for entry in image_entries:
             if len(photos) >= max_photos:
                 out["skipped"].append({"name": entry.get("name"), "reason": "max_photos_reached"})
                 continue
             size = int(entry.get("size") or 0)
-            if size > max_bytes_per_file:
-                out["skipped"].append({"name": entry.get("name"), "reason": "file_too_large", "size": size})
+            if size > max_download_bytes:
+                out["skipped"].append(
+                    {"name": entry.get("name"), "reason": "file_too_large", "size": size, "limit": max_download_bytes}
+                )
                 continue
             downloaded = download_file_bytes(entry["id"])
             if not downloaded.get("ok"):
@@ -386,18 +497,46 @@ def fetch_day_meal_photos(
                     {"name": entry.get("name"), "reason": "download_failed", "error": downloaded.get("error")}
                 )
                 continue
+            raw_data = downloaded["data"]
+            raw_mime = downloaded.get("mime_type") or entry.get("mimeType") or "image/jpeg"
+            remaining_budget = max_total_bytes - total_bytes
+            data, mime_type, final_size, compression = _prepare_meal_image(
+                raw_data,
+                raw_mime,
+                limits=limits,
+                remaining_budget=remaining_budget,
+                max_bytes_per_file=max_bytes_per_file,
+            )
+            del raw_data
+            if data is None or compression == "skipped_too_large":
+                reason = "max_total_bytes_reached" if total_bytes > 0 else "file_too_large_after_compress"
+                out["skipped"].append(
+                    {
+                        "name": entry.get("name"),
+                        "reason": reason,
+                        "size": final_size,
+                        "size_raw": downloaded.get("size") or size,
+                        "total_bytes": total_bytes,
+                        "remaining_budget": remaining_budget,
+                    }
+                )
+                continue
+            total_bytes += final_size
             photos.append(
                 {
                     "file_id": entry["id"],
                     "name": downloaded.get("name") or entry.get("name"),
-                    "mime_type": downloaded.get("mime_type"),
-                    "size": downloaded.get("size") or size,
-                    "data": downloaded["data"],
+                    "mime_type": mime_type,
+                    "size": final_size,
+                    "size_raw": downloaded.get("size") or size,
+                    "compression": compression,
+                    "data": data,
                 }
             )
 
         out["photos"] = photos
         out["photo_count"] = len(photos)
+        out["total_bytes"] = total_bytes
         return out
     except HttpError as e:
         status = getattr(getattr(e, "resp", None), "status", None)
