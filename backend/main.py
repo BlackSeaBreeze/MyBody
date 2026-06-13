@@ -374,7 +374,7 @@ def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, m
     meta = " · ".join(meta_bits)
 
     if analysis_result.get("ok") and analysis_result.get("analysis"):
-        analysis_html = _markdown_to_html(analysis_result["analysis"])
+        analysis_html = report_formats.markdown_to_email_html(analysis_result["analysis"])
     else:
         err = html.escape(str(analysis_result.get("error", "unknown")))
         analysis_html = f'<p style="color:#a33;">Анализ недоступен: {err}</p>'
@@ -385,16 +385,14 @@ def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, m
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
 <body style="margin:0;background:#f5f6f8;">
   <div style="max-width:680px;margin:0 auto;padding:24px 20px;font-family:Arial,Helvetica,sans-serif;color:#222;line-height:1.55;">
-    <h1 style="font-size:20px;margin:0 0 4px;">MyBody — дневной отчёт</h1>
+    <h1 style="font-size:22px;margin:0 0 4px;color:#111;">MyBody — дневной отчёт</h1>
     <div style="color:#888;font-size:13px;margin-bottom:20px;">{meta}</div>
 
-    <h2 style="font-size:16px;margin:18px 0 6px;">Показатели Garmin за день</h2>
+    <h2 style="font-size:16px;margin:18px 0 8px;color:#374151;">Показатели Garmin за день</h2>
     {table_html}
 
-    <h2 style="font-size:16px;margin:18px 0 6px;">Итоговый анализ и рекомендации</h2>
-    <div style="background:#fff;border:1px solid #e3e5e8;border-radius:10px;padding:16px 18px;">
-      {analysis_html}
-    </div>
+    <h2 style="font-size:16px;margin:22px 0 10px;color:#374151;">Итоговый анализ и рекомендации</h2>
+    {analysis_html}
 
     <div style="color:#aaa;font-size:12px;margin-top:20px;">Сформировано автоматически сервисом MyBody.</div>
   </div>

@@ -1,10 +1,12 @@
 """
-Форматы файлов для сохранения на Google Drive (Shorts / Detailed).
+Форматы файлов для сохранения на Google Drive (Shorts / Detailed) и HTML для email.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -132,3 +134,181 @@ def extract_analysis_section(md: str) -> str:
     if idx == -1:
         return md.strip()
     return md[idx + len(marker) :].strip()
+
+
+_SECTION_TITLES: dict[str, str] = {
+    "executive_summary": "Краткий итог",
+    "garmin_key_points": "Garmin — главное",
+    "nutrition_key_points": "Питание — главное",
+    "cross_domain_insights": "Связи Garmin и питания",
+    "unified_recommendations": "Рекомендации на завтра",
+    "watch_out": "На что обратить внимание",
+    "tomorrow_focus": "Фокус на завтра",
+}
+
+_SECTION_ACCENT: dict[str, str] = {
+    "watch_out": "warn",
+    "tomorrow_focus": "good",
+    "executive_summary": "neutral",
+}
+
+_WARN_RE = re.compile(
+    r"severity.*\bhigh\b|\bpriority.*\bhigh\b|\bhigh\b.*(?:severity|priority|риск)|"
+    r"\b(?:риск|дефицит|избыт|недосып|перегруз|опасн|harmful|elevated|повышен|"
+    r"высок(?:ий|ом|ая|ое)?\s+стресс|potentially\s+harmful|мало\s+(?:deep|rem|клетчатки)|"
+    r"недобор|перебор|избыточн|критич|⚠|❌)",
+    re.I,
+)
+_GOOD_RE = re.compile(
+    r"severity.*\blow\b|\bpriority.*\blow\b|\b(?:supportive|neutral|balanced)\b|"
+    r"\b(?:хорош|отличн|достат|в\s+норме|положит|восстановлен|сбалансир|оптималь|"
+    r"нормальн|✅|👍|удовлетвор)",
+    re.I,
+)
+
+
+def _inline_md(text: str) -> str:
+    s = html.escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+
+
+def _line_tone(line: str, section_slug: str) -> str:
+    accent = _SECTION_ACCENT.get(section_slug)
+    if accent == "warn":
+        return "warn"
+    if accent == "good":
+        return "good"
+    if _WARN_RE.search(line):
+        return "warn"
+    if _GOOD_RE.search(line):
+        return "good"
+    return "neutral"
+
+
+def _block_style(tone: str) -> str:
+    if tone == "warn":
+        return (
+            "margin:8px 0;padding:10px 12px;background:#fef2f2;"
+            "border-left:4px solid #dc2626;border-radius:6px;color:#7f1d1d;"
+        )
+    if tone == "good":
+        return (
+            "margin:8px 0;padding:10px 12px;background:#ecfdf5;"
+            "border-left:4px solid #16a34a;border-radius:6px;color:#14532d;"
+        )
+    return "margin:8px 0;padding:2px 0;color:#333;"
+
+
+def _section_header_style(accent: str) -> str:
+    if accent == "warn":
+        return "background:#fee2e2;color:#991b1b;border-bottom:1px solid #fecaca;"
+    if accent == "good":
+        return "background:#dcfce7;color:#166534;border-bottom:1px solid #bbf7d0;"
+    return "background:#eef2ff;color:#1e3a5f;border-bottom:1px solid #dbeafe;"
+
+
+def _render_body_lines(lines: list[str], section_slug: str) -> str:
+    parts: list[str] = []
+    list_buf: list[str] = []
+    list_tone: str | None = None
+
+    def flush_list() -> None:
+        nonlocal list_buf, list_tone
+        if not list_buf:
+            return
+        items = "".join(
+            f'<li style="{_block_style(list_tone or "neutral")}list-style:none;margin-left:0;">'
+            f"{_inline_md(item)}</li>"
+            for item in list_buf
+        )
+        parts.append(
+            f'<ul style="margin:0;padding:0;list-style:none;">{items}</ul>'
+        )
+        list_buf = []
+        list_tone = None
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            flush_list()
+            continue
+        h3 = re.match(r"^###\s+(.*)$", line)
+        if h3:
+            flush_list()
+            parts.append(
+                f'<div style="margin:14px 0 6px;font-size:14px;font-weight:bold;color:#374151;">'
+                f"{_inline_md(h3.group(1))}</div>"
+            )
+            continue
+        ul = re.match(r"^[\*\-]\s+(.*)$", line)
+        ol = re.match(r"^\d+\.\s+(.*)$", line)
+        if ul or ol:
+            content = (ul or ol).group(1)  # type: ignore[union-attr]
+            tone = _line_tone(content, section_slug)
+            if list_buf and list_tone != tone:
+                flush_list()
+            list_tone = tone
+            list_buf.append(content)
+            continue
+        flush_list()
+        tone = _line_tone(line, section_slug)
+        parts.append(f'<p style="{_block_style(tone)}">{_inline_md(line)}</p>')
+
+    flush_list()
+    return "\n".join(parts)
+
+
+def _render_section(slug: str, body: str) -> str:
+    title = _SECTION_TITLES.get(slug, slug.replace("_", " ").strip().capitalize())
+    accent = _SECTION_ACCENT.get(slug, "neutral")
+    if slug == "watch_out":
+        accent = "warn"
+    elif slug == "tomorrow_focus":
+        accent = "good"
+
+    body_html = _render_body_lines(body.split("\n"), slug)
+    border = "#fecaca" if accent == "warn" else "#bbf7d0" if accent == "good" else "#e3e5e8"
+    return f"""
+<div style="margin:0 0 14px;border:1px solid {border};border-radius:10px;overflow:hidden;">
+  <div style="padding:10px 14px;font-size:15px;font-weight:bold;{_section_header_style(accent)}">
+    {html.escape(title)}
+  </div>
+  <div style="padding:12px 14px 14px;background:#fff;font-size:14px;line-height:1.55;">
+    {body_html}
+  </div>
+</div>"""
+
+
+def markdown_to_email_html(text: str) -> str:
+    """
+    Markdown отчёта Gemini → HTML для email/outcomes.
+    ## секции → карточки; риски — красным, позитив — зелёным.
+    """
+    raw = text.strip()
+    if not raw:
+        return ""
+
+    if not re.search(r"^##\s+", raw, flags=re.MULTILINE):
+        return _render_body_lines(raw.split("\n"), "neutral")
+
+    chunks = re.split(r"^##\s+", raw, flags=re.MULTILINE)
+    parts: list[str] = []
+
+    preamble = chunks[0].strip()
+    if preamble:
+        parts.append(
+            f'<div style="margin:0 0 14px;padding:12px 14px;background:#fff;'
+            f'border:1px solid #e3e5e8;border-radius:10px;">'
+            f"{_render_body_lines(preamble.split('\n'), 'neutral')}</div>"
+        )
+
+    for chunk in chunks[1:]:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        lines = chunk.split("\n")
+        slug = lines[0].strip().split()[0]
+        body = "\n".join(lines[1:]).strip()
+        parts.append(_render_section(slug, body))
+
+    return "\n".join(parts)
