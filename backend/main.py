@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from backend import drive_client, email_client, garmin_client, gemini_client
+from backend import drive_client, email_client, garmin_client, gemini_client, storage_client
 from backend import report_formats
 from backend.gemini_client import DEFAULT_GEMINI_MODEL
 
@@ -396,18 +396,23 @@ def daily_report(
     day: str | None = None,
     model: str | None = None,
     send: bool = True,
-    save_drive: bool = True,
+    save_reports: bool = True,
+    save_drive: bool | None = None,
     x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
 ):
     """
     Ежедневный отчёт: метрики Garmin за один день (по умолчанию сегодня; сон = прошедшая ночь),
-    краткий анализ Gemini, подробный архивный анализ, письмо на MAIL_TO и сохранение на Google Drive.
+    краткий анализ Gemini, подробный архивный анализ, письмо на MAIL_TO и сохранение в GCS.
 
-    Drive Shorts: HTML (как в письме). Drive Detailed: Markdown с подробным анализом + JSON метрик.
+    GCS Shorts: HTML (как в письме) → gs://…/outcomes/vb-….html
+    GCS Archive: Markdown → gs://…/archive/vb-….md
 
     Вызов защищён: при заданном CRON_SECRET требуется заголовок X-Cron-Secret.
-    Параметры: day, model, send=false, save_drive=false.
+    Параметры: day, model, send=false, save_reports=false. save_drive — устаревший alias для save_reports.
     """
+    if save_drive is not None:
+        save_reports = save_drive
+
     secret = os.environ.get("CRON_SECRET", "").strip()
     if secret and x_cron_secret != secret:
         raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
@@ -436,14 +441,14 @@ def daily_report(
         day_label=day_label, analysis_result=analysis, summary=summary, model=model
     )
 
-    if save_drive and drive_client.is_configured():
+    if save_reports and storage_client.is_configured():
         short_name = f"{file_stem}.html"
-        short_up = drive_client.upload_to_shorts(short_name, html_body)
-        result["drive_shorts"] = short_up
+        short_up = storage_client.upload_to_outcomes(short_name, html_body)
+        result["storage_outcomes"] = short_up
         if short_up.get("ok"):
-            logger.info("Drive Shorts saved: %s", short_name)
+            logger.info("GCS outcomes saved: %s", short_up.get("gs_uri"))
         else:
-            logger.error("Drive Shorts failed: %s", short_up)
+            logger.error("GCS outcomes failed: %s", short_up)
 
         delay = _gemini_inter_call_delay_sec()
         if delay > 0:
@@ -462,19 +467,19 @@ def daily_report(
                 context_meta=detailed.get("context"),
             )
             detailed_name = f"{file_stem}.md"
-            detailed_up = drive_client.upload_to_detailed(detailed_name, detailed_md)
-            result["drive_detailed"] = detailed_up
+            detailed_up = storage_client.upload_to_archive(detailed_name, detailed_md)
+            result["storage_archive"] = detailed_up
             if detailed_up.get("ok"):
-                logger.info("Drive Detailed saved: %s", detailed_name)
+                logger.info("GCS archive saved: %s", detailed_up.get("gs_uri"))
             else:
-                logger.error("Drive Detailed failed: %s", detailed_up)
+                logger.error("GCS archive failed: %s", detailed_up)
         else:
             result["detailed_analysis_error"] = detailed.get("error")
-            result["drive_detailed"] = {"ok": False, "error": "detailed_analysis_failed"}
+            result["storage_archive"] = {"ok": False, "error": "detailed_analysis_failed"}
             logger.error("Detailed Gemini analysis failed: %s", detailed.get("error"))
-    elif save_drive:
-        result["drive_skipped"] = "drive_not_configured"
-        logger.warning("Drive save skipped: folders not configured")
+    elif save_reports:
+        result["storage_skipped"] = "gcs_not_configured"
+        logger.warning("GCS save skipped: GCS_REPORTS_BUCKET not set")
 
     if send:
         if not email_client.is_configured():
@@ -495,10 +500,22 @@ def daily_report(
         return JSONResponse(result, status_code=502)
     if send and result.get("email_error") and not result.get("emailed"):
         return JSONResponse(result, status_code=502)
-    if save_drive and result.get("drive_shorts", {}).get("ok") is False:
+    if save_reports and result.get("storage_outcomes", {}).get("ok") is False:
         return JSONResponse(result, status_code=502)
 
     return JSONResponse(result)
+
+
+@app.post("/internal/storage-probe")
+def storage_probe(x_cron_secret: str | None = Header(None, alias="X-Cron-Secret")):
+    """Диагностика GCS: пробная запись в bucket отчётов."""
+    secret = os.environ.get("CRON_SECRET", "").strip()
+    if secret and x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
+
+    result = storage_client.probe_access()
+    status = 200 if result.get("ok") else 502
+    return JSONResponse(result, status_code=status)
 
 
 @app.post("/internal/drive-probe")

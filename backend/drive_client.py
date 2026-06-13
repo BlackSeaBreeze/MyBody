@@ -5,8 +5,9 @@
 1. GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON — JSON сервисного аккаунта (Secret Manager).
 2. Application Default Credentials (сервисный аккаунт Cloud Run).
 
-Папки на «Мой диск» должны быть расшарены на email сервисного аккаунта
-(Share → добавить SA с ролью Editor). См. README.
+Папки должны находиться на **Shared drive** (общий диск), не на «Мой диск».
+Сервисный аккаунт добавляют участником Shared drive (Content manager / Contributor).
+Share отдельной папки на «Мой диск» даёт list/get, но create падает с storageQuotaExceeded.
 
 Переменные:
     DRIVE_SHORTS_FOLDER_ID    — папка Outcomes/Shorts
@@ -37,6 +38,9 @@ except ImportError:
 
 _DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive",)
 _DRIVE_HTTP_TIMEOUT_SEC = 120
+# Shared drive API flags (обязательны для записи от сервисного аккаунта)
+_LIST_KW = {"supportsAllDrives": True, "includeItemsFromAllDrives": True}
+_FILE_KW = {"supportsAllDrives": True}
 
 
 def is_configured() -> bool:
@@ -61,9 +65,22 @@ def _credentials():
 def _credential_email(creds) -> str | None:
     for attr in ("service_account_email", "signer_email"):
         val = getattr(creds, attr, None)
-        if val:
+        if val and str(val) != "default":
             return str(val)
-    return None
+    inner = getattr(creds, "_credentials", None) or getattr(creds, "credentials", None)
+    if inner is not None and inner is not creds:
+        return _credential_email(inner)
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return None
 
 
 def _service():
@@ -75,7 +92,7 @@ def _service():
 
 def _find_file_id(service, folder_id: str, name: str) -> str | None:
     q = f"'{folder_id}' in parents and name = '{name.replace(chr(39), '')}' and trashed = false"
-    resp = service.files().list(q=q, fields="files(id)", pageSize=1).execute()
+    resp = service.files().list(q=q, fields="files(id)", pageSize=1, **_LIST_KW).execute()
     files = resp.get("files") or []
     return files[0]["id"] if files else None
 
@@ -104,7 +121,7 @@ def upload_text(
         if existing_id:
             updated = (
                 service.files()
-                .update(fileId=existing_id, media_body=media, fields="id,name,webViewLink")
+                .update(fileId=existing_id, media_body=media, fields="id,name,webViewLink", **_FILE_KW)
                 .execute()
             )
             return {
@@ -115,7 +132,11 @@ def upload_text(
                 "updated": True,
             }
         meta = {"name": filename, "parents": [folder_id]}
-        created = service.files().create(body=meta, media_body=media, fields="id,name,webViewLink").execute()
+        created = (
+            service.files()
+            .create(body=meta, media_body=media, fields="id,name,webViewLink", **_FILE_KW)
+            .execute()
+        )
         return {
             "ok": True,
             "file_id": created.get("id"),
@@ -157,9 +178,15 @@ def _probe_one_folder(service, folder_id: str) -> dict[str, Any]:
     probe_name = ".mybody-drive-probe.txt"
     out: dict[str, Any] = {"folder_id": folder_id}
     try:
-        meta = service.files().get(fileId=folder_id, fields="id,name,mimeType").execute()
+        meta = service.files().get(fileId=folder_id, fields="id,name,mimeType,driveId", **_FILE_KW).execute()
         out["folder_name"] = meta.get("name")
+        out["on_shared_drive"] = bool(meta.get("driveId"))
         out["folder_visible"] = True
+        if not meta.get("driveId"):
+            out["hint"] = (
+                "Папка на «Мой диск». Сервисный аккаунт не может создавать файлы там. "
+                "Перенесите папку на Shared drive и добавьте SA участником (Content manager)."
+            )
     except HttpError as e:
         status = getattr(getattr(e, "resp", None), "status", None)
         out["folder_visible"] = False
@@ -173,6 +200,7 @@ def _probe_one_folder(service, folder_id: str) -> dict[str, Any]:
             q=f"'{folder_id}' in parents and trashed = false",
             pageSize=1,
             fields="files(id)",
+            **_LIST_KW,
         ).execute()
         out["list_ok"] = True
     except HttpError as e:
@@ -195,7 +223,7 @@ def _probe_one_folder(service, folder_id: str) -> dict[str, Any]:
         return out
 
     try:
-        service.files().delete(fileId=created["file_id"]).execute()
+        service.files().delete(fileId=created["file_id"], **_FILE_KW).execute()
         out["probe_deleted"] = True
     except HttpError as e:
         out["probe_deleted"] = False
