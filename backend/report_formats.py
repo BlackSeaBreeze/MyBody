@@ -156,15 +156,31 @@ _WARN_RE = re.compile(
     r"severity.*\bhigh\b|\bpriority.*\bhigh\b|\bhigh\b.*(?:severity|priority|риск)|"
     r"\b(?:риск|дефицит|избыт|недосып|перегруз|опасн|harmful|elevated|повышен|"
     r"высок(?:ий|ом|ая|ое)?\s+стресс|potentially\s+harmful|мало\s+(?:deep|rem|клетчатки)|"
-    r"недобор|перебор|избыточн|критич|⚠|❌)",
+    r"недобор|перебор|избыточн|критич|⚠|❌|"
+    r"\bFAIR\b|\bPOOR\b|удовлетворительн|ниже\s+оптимальн|ниже\s+норм|"
+    r"неплох(?:ой|им|ая|ое)?(?=\s|,|\.)|mixed|зона\s+внимания)",
+    re.I,
+)
+_BAD_RE = re.compile(
+    r"\b(?:bad|critical|severe|критич|опасн|very\s+poor)\b|severity.*\bhigh\b",
     re.I,
 )
 _GOOD_RE = re.compile(
-    r"severity.*\blow\b|\bpriority.*\blow\b|\b(?:supportive|neutral|balanced)\b|"
-    r"\b(?:хорош|отличн|достат|в\s+норме|положит|восстановлен|сбалансир|оптималь|"
-    r"нормальн|✅|👍|удовлетвор)",
+    r"severity.*\blow\b|\bpriority.*\blow\b|\b(?:supportive|balanced)\b|"
+    r"\b(?:хорош(?:о|ий|ая|ее)?|отличн|достаточн|в\s+норме|положител|"
+    r"восстановлен(?:о|ы)?|сбалансир|оптимальн|нормальн|excellent|\bGOOD\b|✅|👍)",
     re.I,
 )
+
+_TONE_IN_BOLD_RE = re.compile(
+    r"^\[(good|warn|neutral|bad)\]\s*\*\*(.+?):\*\*\s*(.*)$",
+    re.I | re.S,
+)
+_BOLD_TONE_RE = re.compile(
+    r"^\*\*\[(good|warn|neutral|bad)\]\s*(.+?):\*\*\s*(.*)$",
+    re.I | re.S,
+)
+_BOLD_LABEL_RE = re.compile(r"^\*\*(.+?):\*\*\s*(.*)$", re.I | re.S)
 
 
 def _inline_md(text: str) -> str:
@@ -172,31 +188,66 @@ def _inline_md(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
 
 
-def _line_tone(line: str, section_slug: str) -> str:
+def _line_tone_heuristic(text: str, section_slug: str) -> str:
     accent = _SECTION_ACCENT.get(section_slug)
     if accent == "warn":
         return "warn"
     if accent == "good":
         return "good"
-    if _WARN_RE.search(line):
+    if _BAD_RE.search(text):
+        return "bad"
+    if _WARN_RE.search(text):
         return "warn"
-    if _GOOD_RE.search(line):
+    if _GOOD_RE.search(text):
         return "good"
     return "neutral"
 
 
-def _block_style(tone: str) -> str:
-    if tone == "warn":
-        return (
-            "margin:8px 0;padding:10px 12px;background:#fef2f2;"
-            "border-left:4px solid #dc2626;border-radius:6px;color:#7f1d1d;"
-        )
+def _label_style(tone: str) -> str:
     if tone == "good":
-        return (
-            "margin:8px 0;padding:10px 12px;background:#ecfdf5;"
-            "border-left:4px solid #16a34a;border-radius:6px;color:#14532d;"
+        return "color:#166534;background:#ecfdf5;padding:2px 8px;border-radius:4px;font-weight:bold;"
+    if tone == "warn":
+        return "color:#9a3412;background:#fff7ed;padding:2px 8px;border-radius:4px;font-weight:bold;"
+    if tone == "bad":
+        return "color:#991b1b;background:#fee2e2;padding:2px 8px;border-radius:4px;font-weight:bold;"
+    return "color:#374151;font-weight:bold;"
+
+
+def _parse_labeled_line(content: str, section_slug: str) -> tuple[str, str | None, str]:
+    """(tone, label_or_none, body) — явный тег Gemini или эвристика только для метки."""
+    for pat in (_TONE_IN_BOLD_RE, _BOLD_TONE_RE):
+        m = pat.match(content.strip())
+        if m:
+            return m.group(1).lower(), m.group(2).strip(), m.group(3).strip()
+
+    m = _BOLD_LABEL_RE.match(content.strip())
+    if m:
+        label, body = m.group(1).strip(), m.group(2).strip()
+        tone = _line_tone_heuristic(f"{label} {body[:120]}", section_slug)
+        if tone == "good" and _WARN_RE.search(body):
+            tone = "warn"
+        return tone, label, body
+
+    return _line_tone_heuristic(content, section_slug), None, content.strip()
+
+
+def _render_line_html(content: str, section_slug: str, *, as_list_item: bool) -> str:
+    tone, label, body = _parse_labeled_line(content, section_slug)
+    tag = "li" if as_list_item else "p"
+    base = "margin:8px 0;padding:0;color:#333;line-height:1.55;list-style:none;"
+
+    if label is not None:
+        label_html = (
+            f'<span style="{_label_style(tone)}">{html.escape(label)}</span>'
         )
-    return "margin:8px 0;padding:2px 0;color:#333;"
+        body_html = _inline_md(body) if body else ""
+        inner = f"{label_html}: {body_html}" if body_html else f"{label_html}:"
+    else:
+        inner = _inline_md(content)
+        if tone in ("good", "warn", "bad"):
+            inner = f'<span style="{_label_style(tone)}">{inner}</span>'
+
+    return f"<{tag} style=\"{base}\">{inner}</{tag}>"
 
 
 def _section_header_style(accent: str) -> str:
@@ -210,22 +261,14 @@ def _section_header_style(accent: str) -> str:
 def _render_body_lines(lines: list[str], section_slug: str) -> str:
     parts: list[str] = []
     list_buf: list[str] = []
-    list_tone: str | None = None
 
     def flush_list() -> None:
-        nonlocal list_buf, list_tone
+        nonlocal list_buf
         if not list_buf:
             return
-        items = "".join(
-            f'<li style="{_block_style(list_tone or "neutral")}list-style:none;margin-left:0;">'
-            f"{_inline_md(item)}</li>"
-            for item in list_buf
-        )
-        parts.append(
-            f'<ul style="margin:0;padding:0;list-style:none;">{items}</ul>'
-        )
+        items = "".join(_render_line_html(item, section_slug, as_list_item=True) for item in list_buf)
+        parts.append(f'<ul style="margin:0;padding:0;">{items}</ul>')
         list_buf = []
-        list_tone = None
 
     for raw in lines:
         line = raw.strip()
@@ -243,16 +286,10 @@ def _render_body_lines(lines: list[str], section_slug: str) -> str:
         ul = re.match(r"^[\*\-]\s+(.*)$", line)
         ol = re.match(r"^\d+\.\s+(.*)$", line)
         if ul or ol:
-            content = (ul or ol).group(1)  # type: ignore[union-attr]
-            tone = _line_tone(content, section_slug)
-            if list_buf and list_tone != tone:
-                flush_list()
-            list_tone = tone
-            list_buf.append(content)
+            list_buf.append((ul or ol).group(1))  # type: ignore[union-attr]
             continue
         flush_list()
-        tone = _line_tone(line, section_slug)
-        parts.append(f'<p style="{_block_style(tone)}">{_inline_md(line)}</p>')
+        parts.append(_render_line_html(line, section_slug, as_list_item=False))
 
     flush_list()
     return "\n".join(parts)
@@ -282,7 +319,7 @@ def _render_section(slug: str, body: str) -> str:
 def markdown_to_email_html(text: str) -> str:
     """
     Markdown отчёта Gemini → HTML для email/outcomes.
-    ## секции → карточки; риски — красным, позитив — зелёным.
+    ## секции → карточки; [good]/[warn]/[bad] на метке — цвет только заголовка пункта.
     """
     raw = text.strip()
     if not raw:

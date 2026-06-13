@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -361,7 +362,14 @@ def _gemini_sleep() -> int:
     return delay
 
 
-def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, model: str) -> str:
+def _daily_email_html(
+    *,
+    day_label: str,
+    analysis_result: dict,
+    summary: dict,
+    model: str,
+    has_food_attachment: bool = False,
+) -> str:
     """Светлое email-оформление: таблица Garmin + итоговый согласованный анализ."""
     ctx = analysis_result.get("context") or {}
     meta_bits = [f"день: {html.escape(day_label)}", f"модель: {html.escape(model)}"]
@@ -380,6 +388,12 @@ def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, m
         analysis_html = f'<p style="color:#a33;">Анализ недоступен: {err}</p>'
 
     table_html = _summary_table_html(summary)
+    attachment_note = (
+        '<p style="color:#888;font-size:13px;margin-top:14px;">'
+        "Подробный анализ питания за день — во вложении (.md), тот же файл что в архиве GCS.</p>"
+        if has_food_attachment
+        else ""
+    )
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
@@ -393,6 +407,7 @@ def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, m
 
     <h2 style="font-size:16px;margin:22px 0 10px;color:#374151;">Итоговый анализ и рекомендации</h2>
     {analysis_html}
+    {attachment_note}
 
     <div style="color:#aaa;font-size:12px;margin-top:20px;">Сформировано автоматически сервисом MyBody.</div>
   </div>
@@ -560,6 +575,7 @@ def daily_report(
     summary = garmin_client.summary_from_metrics(metrics)
     html_body = ""
     combined: dict = {"ok": False, "error": "not_run"}
+    food_archive: dict[str, Any] = {}
 
     if save_reports and storage_client.is_configured():
         # 1) Garmin — только архивный экспертный анализ (один вызов Gemini)
@@ -629,11 +645,13 @@ def daily_report(
             logger.error("Combined analysis failed: %s", combined.get("error"))
         else:
             combined_model = combined.get("model") or result["models"]["combined"]
+            has_food_att = bool(food_archive.get("ok") and food_archive.get("content"))
             html_body = _daily_email_html(
                 day_label=day_label,
                 analysis_result=combined,
                 summary=summary,
                 model=combined_model,
+                has_food_attachment=has_food_att,
             )
             outcome_up = storage_client.upload_to_outcomes(f"{file_stem}.html", html_body)
             result["storage_outcomes"] = outcome_up
@@ -655,10 +673,28 @@ def daily_report(
         else:
             subject = f"MyBody — дневной отчёт за {day_label}"
             text_alt = combined.get("analysis") or "Отчёт MyBody (откройте в HTML-клиенте)."
-            sent = email_client.send_email(subject, html_body, text_body=text_alt)
+            email_attachments: list[dict[str, str]] = []
+            if food_archive.get("ok") and food_archive.get("content"):
+                food_object = food_archive.get("object") or ""
+                food_filename = food_object.rsplit("/", 1)[-1] if food_object else f"{file_stem}-food.md"
+                email_attachments.append(
+                    {
+                        "filename": food_filename,
+                        "content": food_archive["content"],
+                        "content_type": "text/markdown; charset=utf-8",
+                    }
+                )
+            sent = email_client.send_email(
+                subject,
+                html_body,
+                text_body=text_alt,
+                attachments=email_attachments or None,
+            )
             result["emailed"] = bool(sent.get("ok"))
             if sent.get("ok"):
                 result["recipients"] = sent.get("to")
+                if sent.get("attachments"):
+                    result["email_attachments"] = sent["attachments"]
             else:
                 result["email_error"] = sent.get("error")
                 result["email_detail"] = sent.get("detail")

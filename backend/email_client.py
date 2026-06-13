@@ -43,9 +43,15 @@ def is_configured() -> bool:
     return bool(_smtp_user() and os.environ.get("SMTP_PASSWORD", "").strip() and _recipients())
 
 
-def send_email(subject: str, html_body: str, text_body: str | None = None) -> dict[str, Any]:
+def send_email(
+    subject: str,
+    html_body: str,
+    text_body: str | None = None,
+    attachments: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """
     Отправляет письмо с HTML-телом (и текстовой альтернативой).
+    attachments: [{"filename": "…", "content": "…", "content_type": "text/markdown"}]
     Возвращает {"ok": True, "to": [...]} или {"ok": False, "error": "..."}.
     """
     host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
@@ -74,6 +80,27 @@ def send_email(subject: str, html_body: str, text_body: str | None = None) -> di
     msg.set_content(text_body or "Откройте письмо в HTML-совместимом клиенте.")
     msg.add_alternative(html_body, subtype="html")
 
+    attached_names: list[str] = []
+    for att in attachments or []:
+        filename = (att.get("filename") or "attachment.txt").strip()
+        content = att.get("content") or ""
+        if not content:
+            continue
+        ctype = (att.get("content_type") or "text/plain").strip().lower()
+        if "markdown" in ctype or filename.endswith(".md"):
+            maintype, subtype = "text", "plain"
+        elif ctype.startswith("text/"):
+            maintype, subtype = "text", ctype.split("/", 1)[1]
+        else:
+            maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(
+            content.encode("utf-8"),
+            maintype=maintype,
+            subtype=subtype,
+            filename=filename,
+        )
+        attached_names.append(filename)
+
     try:
         context = ssl.create_default_context()
         if port == 465:
@@ -86,6 +113,9 @@ def send_email(subject: str, html_body: str, text_body: str | None = None) -> di
                 server.starttls(context=context)
                 server.login(user, password)
                 server.send_message(msg)
-        return {"ok": True, "to": recipients}
+        out: dict[str, Any] = {"ok": True, "to": recipients}
+        if attached_names:
+            out["attachments"] = attached_names
+        return out
     except Exception as e:
         return {"ok": False, "error": "smtp_send_failed", "detail": str(e)}
