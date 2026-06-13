@@ -93,6 +93,85 @@ def upload_to_archive(
     return upload_text(object_name=f"{_prefix('archive')}{filename}", content=content, content_type=content_type)
 
 
+def download_text(*, object_name: str) -> dict[str, Any]:
+    """Скачивает объект из bucket как текст."""
+    bucket_name = _bucket_name()
+    if storage is None:
+        return {"ok": False, "error": "gcs_sdk_not_installed"}
+    if not bucket_name:
+        return {"ok": False, "error": "gcs_bucket_not_configured"}
+
+    try:
+        bucket = _client().bucket(bucket_name)
+        blob = bucket.blob(object_name)
+        if not blob.exists():
+            return {"ok": False, "error": "object_not_found", "object": object_name, "bucket": bucket_name}
+        content = blob.download_as_text(encoding="utf-8")
+        return {
+            "ok": True,
+            "bucket": bucket_name,
+            "object": object_name,
+            "content": content,
+            "gs_uri": f"gs://{bucket_name}/{object_name}",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "gcs_download_failed",
+            "detail": str(e),
+            "object": object_name,
+            "bucket": bucket_name,
+        }
+
+
+def get_latest_food_analysis_for_day(day_label: str) -> dict[str, Any]:
+    """
+    Последний архивный food-отчёт за календарный день (YYYY-MM-DD).
+    Имена: archive/vb-YYYYMMDD-HHMM-food.md; при нескольких — с максимальным HHMM в имени.
+    """
+    bucket_name = _bucket_name()
+    if storage is None:
+        return {"ok": False, "error": "gcs_sdk_not_installed"}
+    if not bucket_name:
+        return {"ok": False, "error": "gcs_bucket_not_configured"}
+
+    day_compact = day_label.strip().replace("-", "")
+    if len(day_compact) != 8 or not day_compact.isdigit():
+        return {"ok": False, "error": "invalid_day_label", "day": day_label}
+
+    list_prefix = f"{_prefix('archive')}vb-{day_compact}-"
+    try:
+        bucket = _client().bucket(bucket_name)
+        candidates = [
+            b.name
+            for b in bucket.list_blobs(prefix=list_prefix)
+            if b.name.endswith("-food.md")
+        ]
+        if not candidates:
+            return {"ok": False, "error": "no_food_archive_for_day", "day": day_label}
+
+        latest_object = max(candidates)
+        downloaded = download_text(object_name=latest_object)
+        if not downloaded.get("ok"):
+            return downloaded
+        return {
+            "ok": True,
+            "day": day_label,
+            "object": latest_object,
+            "gs_uri": downloaded.get("gs_uri"),
+            "content": downloaded["content"],
+            "candidates_count": len(candidates),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "gcs_list_failed",
+            "detail": str(e),
+            "day": day_label,
+            "bucket": bucket_name,
+        }
+
+
 def probe_access() -> dict[str, Any]:
     """Пробная запись и удаление объекта в bucket."""
     if storage is None:

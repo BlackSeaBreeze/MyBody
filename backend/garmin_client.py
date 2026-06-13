@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # Ленивый импорт: garminconnect ставится опционально для окружений без Garmin
 try:
@@ -376,6 +377,16 @@ def fetch_all_metrics(days: int = 7) -> dict[str, Any]:
         return {"ok": False, "error": str(e), "metrics_by_day": None}
 
 
+def _report_calendar_day() -> Any:
+    """Календарный «сегодня» в REPORT_TIMEZONE (как file_stem и папки Meals)."""
+    tz_name = os.environ.get("REPORT_TIMEZONE", "Europe/Dublin").strip() or "Europe/Dublin"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Europe/Dublin")
+    return datetime.now(tz).date()
+
+
 def fetch_daily_metrics(day: str | None = None) -> dict[str, Any]:
     """
     Загружает все метрики за один календарный день (по умолчанию — сегодня).
@@ -390,7 +401,7 @@ def fetch_daily_metrics(day: str | None = None) -> dict[str, Any]:
         if day:
             target = datetime.fromisoformat(day).date()
         else:
-            target = datetime.now().date()
+            target = _report_calendar_day()
         return _collect_metrics_range(api, target, target)
     except Exception as e:
         return {"ok": False, "error": str(e), "metrics_by_day": None}

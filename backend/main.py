@@ -354,12 +354,23 @@ def _summary_table_html(summary: dict) -> str:
     )
 
 
+def _gemini_sleep() -> int:
+    delay = _gemini_inter_call_delay_sec()
+    if delay > 0:
+        time.sleep(delay)
+    return delay
+
+
 def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, model: str) -> str:
-    """Светлое email-оформление: заголовок, таблица показателей, AI-анализ."""
+    """Светлое email-оформление: таблица Garmin + итоговый согласованный анализ."""
     ctx = analysis_result.get("context") or {}
-    meta_bits = [f"период: {html.escape(day_label)}", f"модель: {html.escape(model)}"]
+    meta_bits = [f"день: {html.escape(day_label)}", f"модель: {html.escape(model)}"]
+    if ctx.get("has_food_analysis"):
+        meta_bits.append("Garmin + питание")
+    else:
+        meta_bits.append("только Garmin")
     if ctx.get("est_tokens") is not None:
-        meta_bits.append(f"~{ctx.get('est_tokens'):,} токенов".replace(",", " "))
+        meta_bits.append(f"~{ctx.get('est_tokens'):,} токенов Garmin".replace(",", " "))
     meta = " · ".join(meta_bits)
 
     if analysis_result.get("ok") and analysis_result.get("analysis"):
@@ -374,13 +385,13 @@ def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, m
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
 <body style="margin:0;background:#f5f6f8;">
   <div style="max-width:680px;margin:0 auto;padding:24px 20px;font-family:Arial,Helvetica,sans-serif;color:#222;line-height:1.55;">
-    <h1 style="font-size:20px;margin:0 0 4px;">MyBody — отчёт Garmin</h1>
+    <h1 style="font-size:20px;margin:0 0 4px;">MyBody — дневной отчёт</h1>
     <div style="color:#888;font-size:13px;margin-bottom:20px;">{meta}</div>
 
-    <h2 style="font-size:16px;margin:18px 0 6px;">Показатели за день</h2>
+    <h2 style="font-size:16px;margin:18px 0 6px;">Показатели Garmin за день</h2>
     {table_html}
 
-    <h2 style="font-size:16px;margin:18px 0 6px;">Анализ и рекомендации</h2>
+    <h2 style="font-size:16px;margin:18px 0 6px;">Итоговый анализ и рекомендации</h2>
     <div style="background:#fff;border:1px solid #e3e5e8;border-radius:10px;padding:16px 18px;">
       {analysis_html}
     </div>
@@ -477,14 +488,14 @@ def daily_report(
     x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
 ):
     """
-    Ежедневный отчёт: метрики Garmin за один день (по умолчанию сегодня; сон = прошедшая ночь),
-    краткий анализ Gemini, подробный архивный анализ, письмо на MAIL_TO и сохранение в GCS.
+    Ежедневный отчёт за один календарный день (по умолчанию сегодня в REPORT_TIMEZONE; сон = прошедшая ночь).
 
-    GCS Shorts: HTML (как в письме) → gs://…/outcomes/vb-….html
-    GCS Archive: Markdown → gs://…/archive/vb-….md и vb-…-food.md (анализ фото еды из Drive Meals)
+    Порядок:
+    1) Garmin → один Gemini-вызов → archive/vb-….md (сырые метрики остаются в памяти)
+    2) Фото еды → archive/vb-…-food.md
+    3) Сырые Garmin + последний food-архив за день → итоговый Gemini → outcomes/vb-….html + email
 
     Вызов защищён: при заданном CRON_SECRET требуется заголовок X-Cron-Secret.
-    Параметры: day, model, send=false, save_reports=false. save_drive — устаревший alias для save_reports.
     """
     if save_drive is not None:
         save_reports = save_drive
@@ -507,30 +518,12 @@ def daily_report(
             result["hint"] = metrics["hint"]
         return JSONResponse(result, status_code=502)
 
-    analysis = gemini_client.analyze_garmin_metrics(metrics, model=model)
     summary = garmin_client.summary_from_metrics(metrics)
-    result["analysis_ok"] = bool(analysis.get("ok"))
-    if not analysis.get("ok"):
-        result["analysis_error"] = analysis.get("error")
-
-    html_body = _daily_email_html(
-        day_label=day_label, analysis_result=analysis, summary=summary, model=model
-    )
+    html_body = ""
+    combined: dict = {"ok": False, "error": "not_run"}
 
     if save_reports and storage_client.is_configured():
-        short_name = f"{file_stem}.html"
-        short_up = storage_client.upload_to_outcomes(short_name, html_body)
-        result["storage_outcomes"] = short_up
-        if short_up.get("ok"):
-            logger.info("GCS outcomes saved: %s", short_up.get("gs_uri"))
-        else:
-            logger.error("GCS outcomes failed: %s", short_up)
-
-        delay = _gemini_inter_call_delay_sec()
-        if delay > 0:
-            time.sleep(delay)
-        result["gemini_inter_call_delay_sec"] = delay
-
+        # 1) Garmin — только архивный экспертный анализ (один вызов Gemini)
         detailed = gemini_client.analyze_garmin_metrics_detailed(metrics, model=model)
         result["detailed_analysis_ok"] = bool(detailed.get("ok"))
         if detailed.get("ok"):
@@ -542,8 +535,7 @@ def daily_report(
                 model=model,
                 context_meta=detailed.get("context"),
             )
-            detailed_name = f"{file_stem}.md"
-            detailed_up = storage_client.upload_to_archive(detailed_name, detailed_md)
+            detailed_up = storage_client.upload_to_archive(f"{file_stem}.md", detailed_md)
             result["storage_archive"] = detailed_up
             if detailed_up.get("ok"):
                 logger.info("GCS archive saved: %s", detailed_up.get("gs_uri"))
@@ -552,8 +544,11 @@ def daily_report(
         else:
             result["detailed_analysis_error"] = detailed.get("error")
             result["storage_archive"] = {"ok": False, "error": "detailed_analysis_failed"}
-            logger.error("Detailed Gemini analysis failed: %s", detailed.get("error"))
+            logger.error("Detailed Garmin analysis failed: %s", detailed.get("error"))
 
+        result["gemini_inter_call_delay_sec"] = _gemini_sleep()
+
+        # 2) Еда → archive/vb-…-food.md
         _save_food_analysis(
             day_label=day_label,
             file_stem=file_stem,
@@ -561,17 +556,63 @@ def daily_report(
             metrics=metrics,
             result=result,
         )
+
+        result["gemini_inter_call_delay_sec"] = _gemini_sleep()
+
+        # 3) Последний food-архив за день + сырые Garmin → итоговый отчёт
+        food_archive = storage_client.get_latest_food_analysis_for_day(day_label)
+        food_analysis_text: str | None = None
+        if food_archive.get("ok"):
+            food_analysis_text = report_formats.extract_analysis_section(food_archive["content"])
+            result["food_archive_used"] = {
+                "object": food_archive.get("object"),
+                "gs_uri": food_archive.get("gs_uri"),
+                "candidates_count": food_archive.get("candidates_count"),
+            }
+        else:
+            result["food_archive_used"] = {
+                "ok": False,
+                "error": food_archive.get("error"),
+            }
+            logger.warning("No food archive for combined report: %s", food_archive.get("error"))
+
+        combined = gemini_client.analyze_daily_combined(
+            metrics,
+            food_analysis=food_analysis_text,
+            day_label=day_label,
+            model=model,
+        )
+        result["combined_analysis_ok"] = bool(combined.get("ok"))
+        if not combined.get("ok"):
+            result["combined_analysis_error"] = combined.get("error")
+            logger.error("Combined analysis failed: %s", combined.get("error"))
+        else:
+            html_body = _daily_email_html(
+                day_label=day_label,
+                analysis_result=combined,
+                summary=summary,
+                model=model,
+            )
+            outcome_up = storage_client.upload_to_outcomes(f"{file_stem}.html", html_body)
+            result["storage_outcomes"] = outcome_up
+            if outcome_up.get("ok"):
+                logger.info("GCS outcomes saved: %s", outcome_up.get("gs_uri"))
+            else:
+                logger.error("GCS outcomes failed: %s", outcome_up)
     elif save_reports:
         result["storage_skipped"] = "gcs_not_configured"
         logger.warning("GCS save skipped: GCS_REPORTS_BUCKET not set")
 
     if send:
-        if not email_client.is_configured():
+        if not combined.get("ok"):
+            result["emailed"] = False
+            result["email_error"] = combined.get("error") or "combined_analysis_not_available"
+        elif not email_client.is_configured():
             result["emailed"] = False
             result["email_error"] = "smtp_not_configured"
         else:
-            subject = f"MyBody — отчёт Garmin за {day_label}"
-            text_alt = analysis.get("analysis") or "Отчёт MyBody (откройте в HTML-клиенте)."
+            subject = f"MyBody — дневной отчёт за {day_label}"
+            text_alt = combined.get("analysis") or "Отчёт MyBody (откройте в HTML-клиенте)."
             sent = email_client.send_email(subject, html_body, text_body=text_alt)
             result["emailed"] = bool(sent.get("ok"))
             if sent.get("ok"):

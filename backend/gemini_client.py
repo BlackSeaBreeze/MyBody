@@ -554,3 +554,108 @@ def analyze_food_photos(
         return {"ok": True, "analysis": response.text.strip(), "model": model, "context": meta}
     except Exception as e:
         return {"ok": False, "error": str(e), "analysis": None, "context": meta}
+
+
+SYSTEM_PROMPT_COMBINED = """Ты — персональный health-coach: спортивная медицина, сон, восстановление и нутрициология.
+Тебе передают два источника за ОДИН календарный день:
+1) сырые данные Garmin Connect;
+2) архивный экспертный анализ питания (уже посчитан по фото еды).
+
+Задача: СОГЛАСОВАТЬ Garmin и питание, найти связи, противоречия и приоритеты.
+Этот отчёт пойдёт пользователю в email и HTML — пиши ясно, структурированно, без сырых JSON и без
+переписывания входных данных. Цифры — только как доказательства к выводам.
+
+ОБЯЗАТЕЛЬНАЯ СТРУКТУРА (Markdown):
+
+## executive_summary
+3–5 предложений: как прошёл день в целом (восстановление + нагрузка + питание).
+
+## garmin_key_points
+Главное из Garmin: сон, стресс/HRV, Body Battery, нагрузка — только значимое для решений.
+
+## nutrition_key_points
+Главное из анализа питания: калории, БЖУ, клетчатка, ключевые дефициты/избытки, микробиом — кратко.
+
+## cross_domain_insights
+Минимум 4 связи «Garmin ↔ питание», например:
+- поздний/тяжёлый ужин ↔ сон/ЧСС/стресс;
+- недобор белка/клетчатки ↔ восстановление;
+- перегруз ↔ калории/углеводы;
+- кофеин/алкоголь (если упомянуты в питании) ↔ сон/HRV.
+Различай факты и гипотезы.
+
+## unified_recommendations
+5–7 конкретных рекомендаций на завтра с приоритетом (high/medium/low):
+сон, нагрузка, питание, микробиом, режим. Каждая — actionable.
+
+## watch_out
+2–4 риска или зоны внимания (severity + evidence).
+
+## tomorrow_focus
+Одно предложение — главный фокус на следующий день.
+
+Правила:
+- Язык: русский.
+- Если анализа питания нет — явно укажи и опирайся только на Garmin.
+- Стресс Garmin = HRV-метрика, не психология.
+- Не дублируй длинные архивные тексты — синтезируй.
+- Не ставь медицинских диагнозов."""
+
+
+def analyze_daily_combined(
+    metrics: dict[str, Any],
+    *,
+    food_analysis: str | None,
+    day_label: str,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """
+    Итоговый согласованный отчёт: сырые Garmin + архивный анализ питания → рекомендации для email/outcomes.
+    """
+    if genai is None or types is None:
+        return {"ok": False, "error": "gemini_sdk_not_installed", "analysis": None}
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"ok": False, "error": "gemini_not_configured", "analysis": None}
+    if not metrics.get("ok"):
+        return {
+            "ok": False,
+            "error": metrics.get("error", "garmin_data_unavailable"),
+            "analysis": None,
+        }
+
+    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    text_context, meta = build_prompt_context(metrics)
+    meta = {**meta, "day": day_label, "has_food_analysis": bool(food_analysis and food_analysis.strip())}
+
+    food_block = (
+        food_analysis.strip()
+        if food_analysis and food_analysis.strip()
+        else "нет архивного анализа питания за этот день"
+    )
+    user_content = (
+        f"Дата: {day_label}.\n\n"
+        "Ниже сырые данные Garmin Connect за день и архивный экспертный анализ питания за тот же день. "
+        "Согласуй оба источника и сформируй итоговый отчёт по структуре из инструкции.\n\n"
+        "=== Архивный экспертный анализ питания ===\n"
+        f"{food_block}\n\n"
+        "=== Сырые данные Garmin Connect ===\n"
+        f"{text_context}"
+    )
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT_COMBINED,
+                temperature=0.35,
+                max_output_tokens=8192,
+            ),
+        )
+        if not response or not getattr(response, "text", None):
+            return {"ok": False, "error": "empty_gemini_response", "analysis": None, "context": meta}
+        return {"ok": True, "analysis": response.text.strip(), "model": model, "context": meta}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "analysis": None, "context": meta}

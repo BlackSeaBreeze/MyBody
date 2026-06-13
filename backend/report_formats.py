@@ -123,3 +123,12 @@ def build_food_report_md(
 
 {food_analysis.strip()}
 """
+
+
+def extract_analysis_section(md: str) -> str:
+    """Текст секции «## Анализ» из архивного Markdown (без метаданных)."""
+    marker = "## Анализ"
+    idx = md.find(marker)
+    if idx == -1:
+        return md.strip()
+    return md[idx + len(marker) :].strip()
