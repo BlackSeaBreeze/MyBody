@@ -400,6 +400,36 @@ def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, m
 </html>"""
 
 
+def _note_gemini_failure(result: dict, step_result: dict | None, step: str) -> None:
+    if not step_result or step_result.get("ok"):
+        return
+    err = str(step_result.get("error", ""))
+    if step_result.get("error_kind") == "gemini_daily_quota_exhausted" or gemini_client.is_daily_quota_error(err):
+        result["gemini_daily_quota"] = True
+        result["gemini_hint"] = step_result.get("hint") or (
+            "Исчерпан дневной лимит free tier Gemini. Подождите до следующего дня (UTC) "
+            "или задайте GEMINI_MODEL_FOOD / GEMINI_MODEL_COMBINED на другие модели."
+        )
+    ctx = step_result.get("context") or {}
+    if ctx.get("models_tried"):
+        result.setdefault("gemini_models_tried", {})[step] = ctx["models_tried"]
+
+
+def _daily_report_http_status(result: dict, *, send: bool, save_reports: bool) -> int:
+    if not result.get("ok"):
+        return 502
+    if result.get("gemini_daily_quota"):
+        return 200
+    if send and result.get("email_error") and not result.get("emailed"):
+        err = str(result.get("combined_analysis_error", ""))
+        if gemini_client.is_retryable_gemini_error(err):
+            return 503
+        return 502
+    if save_reports and result.get("storage_outcomes", {}).get("ok") is False:
+        return 502
+    return 200
+
+
 def _profile_hint_from_metrics(metrics: dict) -> str | None:
     """Краткий профиль из Garmin для уточнения норм питания."""
     profile = (metrics.get("global_metrics") or {}).get("user_profile")
@@ -417,7 +447,7 @@ def _save_food_analysis(
     *,
     day_label: str,
     file_stem: str,
-    model: str,
+    model: str | None,
     metrics: dict,
     result: dict,
 ) -> None:
@@ -455,6 +485,7 @@ def _save_food_analysis(
         profile_hint=_profile_hint_from_metrics(metrics),
     )
     result["food_analysis_ok"] = bool(food.get("ok"))
+    _note_gemini_failure(result, food, "food")
     if not food.get("ok"):
         result["food_analysis_error"] = food.get("error")
         logger.error("Food Gemini analysis failed: %s", food.get("error"))
@@ -463,7 +494,7 @@ def _save_food_analysis(
     food_md = report_formats.build_food_report_md(
         day_label=day_label,
         food_analysis=food["analysis"],
-        model=model,
+        model=food.get("model") or gemini_client.model_for_step("food", model),
         photo_meta=meals,
         context_meta=food.get("context"),
     )
@@ -504,9 +535,19 @@ def daily_report(
 
     metrics = garmin_client.fetch_daily_metrics(day=day)
     day_label = str(metrics.get("to") or day or "сегодня")
-    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    gemini_override = model.strip() if model else None
     file_stem = report_formats.drive_file_stem()
-    result: dict = {"ok": bool(metrics.get("ok")), "day": day_label, "file_stem": file_stem, "model": model}
+    result: dict = {
+        "ok": bool(metrics.get("ok")),
+        "day": day_label,
+        "file_stem": file_stem,
+        "model": gemini_override or gemini_client.DEFAULT_GEMINI_MODEL,
+        "models": {
+            "archive": gemini_client.model_for_step("archive", gemini_override),
+            "food": gemini_client.model_for_step("food", gemini_override),
+            "combined": gemini_client.model_for_step("combined", gemini_override),
+        },
+    }
 
     if not metrics.get("ok"):
         result["error"] = metrics.get("error")
@@ -522,15 +563,16 @@ def daily_report(
 
     if save_reports and storage_client.is_configured():
         # 1) Garmin — только архивный экспертный анализ (один вызов Gemini)
-        detailed = gemini_client.analyze_garmin_metrics_detailed(metrics, model=model)
+        detailed = gemini_client.analyze_garmin_metrics_detailed(metrics, model=gemini_override)
         result["detailed_analysis_ok"] = bool(detailed.get("ok"))
+        _note_gemini_failure(result, detailed, "archive")
         if detailed.get("ok"):
             detailed_md = report_formats.build_detailed_report_md(
                 day_label=day_label,
                 detailed_analysis=detailed["analysis"],
                 metrics=metrics,
                 summary=summary,
-                model=model,
+                model=detailed.get("model") or result["models"]["archive"],
                 context_meta=detailed.get("context"),
             )
             detailed_up = storage_client.upload_to_archive(f"{file_stem}.md", detailed_md)
@@ -550,7 +592,7 @@ def daily_report(
         _save_food_analysis(
             day_label=day_label,
             file_stem=file_stem,
-            model=model,
+            model=gemini_override,
             metrics=metrics,
             result=result,
         )
@@ -578,18 +620,20 @@ def daily_report(
             metrics,
             food_analysis=food_analysis_text,
             day_label=day_label,
-            model=model,
+            model=gemini_override,
         )
         result["combined_analysis_ok"] = bool(combined.get("ok"))
+        _note_gemini_failure(result, combined, "combined")
         if not combined.get("ok"):
             result["combined_analysis_error"] = combined.get("error")
             logger.error("Combined analysis failed: %s", combined.get("error"))
         else:
+            combined_model = combined.get("model") or result["models"]["combined"]
             html_body = _daily_email_html(
                 day_label=day_label,
                 analysis_result=combined,
                 summary=summary,
-                model=model,
+                model=combined_model,
             )
             outcome_up = storage_client.upload_to_outcomes(f"{file_stem}.html", html_body)
             result["storage_outcomes"] = outcome_up
@@ -619,14 +663,11 @@ def daily_report(
                 result["email_error"] = sent.get("error")
                 result["email_detail"] = sent.get("detail")
 
-    if not result.get("ok"):
-        return JSONResponse(result, status_code=502)
-    if send and result.get("email_error") and not result.get("emailed"):
-        return JSONResponse(result, status_code=502)
-    if save_reports and result.get("storage_outcomes", {}).get("ok") is False:
-        return JSONResponse(result, status_code=502)
-
-    return JSONResponse(result)
+    status = _daily_report_http_status(result, send=send, save_reports=save_reports)
+    if result.get("gemini_daily_quota"):
+        result["ok"] = False
+        result.setdefault("partial", True)
+    return JSONResponse(result, status_code=status)
 
 
 @app.post("/internal/storage-probe")

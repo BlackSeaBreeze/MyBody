@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import time
 from typing import Any
 
 try:
@@ -15,6 +18,123 @@ try:
 except ImportError:
     genai = None  # type: ignore
     types = None  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+_RETRY_DELAY_RE = re.compile(r"retry in (\d+(?:\.\d+)?)s", re.I)
+_DAILY_QUOTA_MARKERS = (
+    "GenerateRequestsPerDayPerProjectPerModel",
+    "PerDayPerProjectPerModel-FreeTier",
+)
+
+
+def is_daily_quota_error(error: str | None) -> bool:
+    if not error:
+        return False
+    return any(m in error for m in _DAILY_QUOTA_MARKERS)
+
+
+def is_retryable_gemini_error(error: str | None) -> bool:
+    if not error or is_daily_quota_error(error):
+        return False
+    return any(x in error for x in ("429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE"))
+
+
+def _max_gemini_retries() -> int:
+    try:
+        return max(1, int(os.environ.get("GEMINI_MAX_RETRIES", "4")))
+    except ValueError:
+        return 4
+
+
+def _retry_sleep_seconds(error: str, attempt: int) -> float:
+    m = _RETRY_DELAY_RE.search(error)
+    if m:
+        return float(m.group(1)) + 2.0
+    return min(45.0, 8.0 * (attempt + 1))
+
+
+def _model_chain(preferred: str) -> list[str]:
+    chain: list[str] = []
+    for name in (
+        preferred.strip(),
+        os.environ.get("GEMINI_MODEL_FALLBACK", "").strip(),
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash-lite",
+    ):
+        if name and name not in chain:
+            chain.append(name)
+    return chain
+
+
+def _generate_with_retry(
+    *,
+    contents: Any,
+    config: Any,
+    model: str,
+    context_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Вызов Gemini с retry (429/503) и fallback на другие модели при дневной квоте."""
+    meta: dict[str, Any] = dict(context_meta or {})
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if genai is None or types is None:
+        return {"ok": False, "error": "gemini_sdk_not_installed", "analysis": None, "context": meta}
+    if not api_key:
+        return {"ok": False, "error": "gemini_not_configured", "analysis": None, "context": meta}
+
+    client = genai.Client(api_key=api_key)
+    last_error = ""
+    models_tried: list[str] = []
+    max_retries = _max_gemini_retries()
+
+    for try_model in _model_chain(model):
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=try_model,
+                    contents=contents,
+                    config=config,
+                )
+                if not response or not getattr(response, "text", None):
+                    last_error = "empty_gemini_response"
+                    break
+                meta_out = {**meta, "model_used": try_model, "models_tried": models_tried + [try_model]}
+                return {"ok": True, "analysis": response.text.strip(), "model": try_model, "context": meta_out}
+            except Exception as e:
+                last_error = str(e)
+                if try_model not in models_tried:
+                    models_tried.append(try_model)
+                if is_daily_quota_error(last_error):
+                    logger.warning("Gemini daily quota for model %s, trying fallback", try_model)
+                    break
+                if is_retryable_gemini_error(last_error) and attempt + 1 < max_retries:
+                    delay = _retry_sleep_seconds(last_error, attempt)
+                    logger.warning(
+                        "Gemini retry %s/%s model=%s sleep=%.0fs: %s",
+                        attempt + 1,
+                        max_retries,
+                        try_model,
+                        delay,
+                        last_error[:180],
+                    )
+                    time.sleep(delay)
+                    continue
+                break
+
+    out: dict[str, Any] = {
+        "ok": False,
+        "error": last_error,
+        "analysis": None,
+        "context": {**meta, "models_tried": models_tried},
+    }
+    if is_daily_quota_error(last_error):
+        out["error_kind"] = "gemini_daily_quota_exhausted"
+        out["hint"] = (
+            "Исчерпан дневной лимит free tier Gemini (20 запросов/модель/день). "
+            "Подождите до следующего дня (UTC), включите billing или задайте GEMINI_MODEL_FALLBACK."
+        )
+    return out
 
 
 def is_configured() -> bool:
@@ -331,21 +451,27 @@ def _call_gemini(
     if max_output_tokens is not None:
         cfg_kwargs["max_output_tokens"] = max_output_tokens
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=user_content,
-            config=types.GenerateContentConfig(**cfg_kwargs),
-        )
-        if not response or not getattr(response, "text", None):
-            return {"ok": False, "error": "empty_gemini_response", "analysis": None, "context": meta}
-        return {"ok": True, "analysis": response.text.strip(), "model": model, "context": meta}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "analysis": None, "context": meta}
+    return _generate_with_retry(
+        contents=user_content,
+        config=types.GenerateContentConfig(**cfg_kwargs),
+        model=model,
+        context_meta=meta,
+    )
 
 
 DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+
+
+def model_for_step(step: str, override: str | None = None) -> str:
+    """Модель для шага pipeline: archive / food / combined (разные env → разные дневные квоты)."""
+    if override:
+        return override.strip()
+    env_key = {
+        "archive": "GEMINI_MODEL",
+        "food": "GEMINI_MODEL_FOOD",
+        "combined": "GEMINI_MODEL_COMBINED",
+    }.get(step, "GEMINI_MODEL")
+    return (os.environ.get(env_key, "") or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
 
 
 def analyze_garmin_metrics(metrics: dict[str, Any], model: str | None = None) -> dict[str, Any]:
@@ -377,7 +503,7 @@ def analyze_garmin_metrics_detailed(
     Экспертный архивный анализ за день для GCS archive/.
     Только выводы и интерпретации — без дублирования сырых метрик в ответе.
     """
-    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    model = model_for_step("archive", model)
     return _call_gemini(
         metrics=metrics,
         model=model,
@@ -515,7 +641,7 @@ def analyze_food_photos(
     if not photos:
         return {"ok": False, "error": "no_photos", "analysis": None}
 
-    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    model = model_for_step("food", model)
     intro = (
         f"Дата: {day_label}. Ниже {len(photos)} фото еды за этот день. "
         "Оцени всё съеденное за день, суммируй нутриенты, сравни с суточными нормами, "
@@ -536,24 +662,16 @@ def analyze_food_photos(
         parts.append(types.Part.from_bytes(data=data, mime_type=mime))
 
     meta = {"photo_count": len(photos), "day": day_label}
-    cfg_kwargs: dict[str, Any] = {
-        "system_instruction": SYSTEM_PROMPT_FOOD,
-        "temperature": 0.2,
-        "max_output_tokens": 16384,
-    }
-
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=parts,
-            config=types.GenerateContentConfig(**cfg_kwargs),
-        )
-        if not response or not getattr(response, "text", None):
-            return {"ok": False, "error": "empty_gemini_response", "analysis": None, "context": meta}
-        return {"ok": True, "analysis": response.text.strip(), "model": model, "context": meta}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "analysis": None, "context": meta}
+    return _generate_with_retry(
+        contents=parts,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT_FOOD,
+            temperature=0.2,
+            max_output_tokens=16384,
+        ),
+        model=model,
+        context_meta=meta,
+    )
 
 
 SYSTEM_PROMPT_COMBINED = """Ты — персональный health-coach: спортивная медицина, сон, восстановление и нутрициология.
@@ -624,7 +742,7 @@ def analyze_daily_combined(
             "analysis": None,
         }
 
-    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    model = model_for_step("combined", model)
     text_context, meta = build_prompt_context(metrics)
     meta = {**meta, "day": day_label, "has_food_analysis": bool(food_analysis and food_analysis.strip())}
 
@@ -643,19 +761,13 @@ def analyze_daily_combined(
         f"{text_context}"
     )
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=user_content,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT_COMBINED,
-                temperature=0.35,
-                max_output_tokens=8192,
-            ),
-        )
-        if not response or not getattr(response, "text", None):
-            return {"ok": False, "error": "empty_gemini_response", "analysis": None, "context": meta}
-        return {"ok": True, "analysis": response.text.strip(), "model": model, "context": meta}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "analysis": None, "context": meta}
+    return _generate_with_retry(
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT_COMBINED,
+            temperature=0.35,
+            max_output_tokens=8192,
+        ),
+        model=model,
+        context_meta=meta,
+    )
