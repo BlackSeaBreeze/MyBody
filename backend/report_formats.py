@@ -104,9 +104,13 @@ def build_food_report_md(
         "model": model,
         "generated_at_utc": generated_at,
         "purpose": "nutrition_tracking_and_reanalysis",
+        "photos_found_in_folder": pm.get("images_found") or pm.get("photo_count"),
         "photos_analyzed": ctx.get("photo_count") or pm.get("photo_count"),
+        "photos_skipped_count": pm.get("photos_skipped_count") or len(pm.get("skipped") or []),
+        "analysis_complete": pm.get("analysis_complete", True),
         "drive_folder": pm.get("folder_name"),
         "photo_names": [p.get("name") for p in (pm.get("photos") or []) if p.get("name")],
+        "photos_skipped": pm.get("skipped") or [],
     }
 
     meta_json = json.dumps(frontmatter, ensure_ascii=False, indent=2)

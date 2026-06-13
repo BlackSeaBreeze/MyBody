@@ -12,6 +12,8 @@ import re
 import time
 from typing import Any
 
+from backend import drive_client
+
 try:
     from google import genai
     from google.genai import types
@@ -20,6 +22,21 @@ except ImportError:
     types = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+# Garmin привязывает sleep_data к дате пробуждения — модели часто путают порядок «сон ↔ активность дня».
+GARMIN_DAY_CHRONOLOGY = """
+ХРОНОЛОГИЯ КАЛЕНДАРНОГО ДНЯ В GARMIN (критично — не путай причину и следствие):
+- Все данные за дату D (YYYY-MM-DD) описывают календарный день D.
+- sleep_data за D — сон, ЗАКОНЧИВШИЙСЯ утром D (ночь с D−1 на D). Это ПРОШЛАЯ ночь, ДО дневных событий D.
+- Утренние показатели (Body Battery при пробуждении, morning readiness, утренний RHR) — итог этого сна, ещё ДО активности D.
+- Шаги, тренировки, стресс днём, калории, питание и заметки пользователя за D — ПОСЛЕ пробуждения, ПОСЛЕ sleep_data за D.
+- Сон «сегодня вечером» после активности D в данных за D отсутствует — он попадёт в sleep_data за D+1.
+- ЗАПРЕЩЕНО: «несмотря на активный день, сон был плохим» / «активность повлияла на сон» для sleep_data за D —
+  этот сон был РАНЬШЕ активности. Велопрогулка/нагрузка D не объясняет сон, закончившийся утром D.
+- Питание и нагрузка D могут влиять на сон ночи D→D+1 (будущие данные), но НЕ на sleep_data за D.
+- В summary и executive_summary: сначала прошедшая ночь (сон → пробуждение), затем как прошёл день после пробуждения.
+- Плохой сон утром D + высокая активность днём D: ищи причины сна во вечере/ночи D−1, режиме, стрессе вчера — не в дневной активности D.
+"""
 
 _RETRY_DELAY_RE = re.compile(r"retry in (\d+(?:\.\d+)?)s", re.I)
 _DAILY_QUOTA_MARKERS = (
@@ -335,6 +352,7 @@ SYSTEM_PROMPT = """Ты — персональный помощник по зд�
 - Выдели КОНКРЕТНЫЕ дни и временные интервалы с пиками стресса и рядом приведи цифры коррелирующих показателей, чтобы вывод был доказательным, а не общим.
 - Отметь, каких данных не хватает, чтобы точнее установить причину (например, время и состав еды, алкоголь, кофеин, субъективное самочувствие).
 
+""" + GARMIN_DAY_CHRONOLOGY + """
 Формат ответа: на русском языке, структурированно (короткие абзацы или списки), без лишнего вступления. Не придумывай данные — опирайся только на переданные метрики; формулируй причинно-следственные связи как обоснованные гипотезы, а не как факты."""
 
 
@@ -346,16 +364,18 @@ SYSTEM_PROMPT_DETAILED = """Ты — медицинско-спортивный �
 НЕ переписывай и НЕ дублируй сырые данные, временные ряды и JSON. Цифры включай только как доказательства
 к конкретным выводам (например: «пик стресса 87 около 15:00 совпал с…», а не полный список всех значений).
 
+""" + GARMIN_DAY_CHRONOLOGY + """
 ОБЯЗАТЕЛЬНАЯ СТРУКТУРА (Markdown, все секции заполни; если данных нет — «нет данных»):
 
 ## meta
 - date: YYYY-MM-DD
-- overall_day_assessment: 2–4 предложения — как прошёл день с точки зрения восстановления, нагрузки и рисков
+- overall_day_assessment: 2–4 предложения — сначала итог прошедшей ночи (сон → пробуждение), затем день после пробуждения (нагрузка, восстановление, риски). Не связывай дневную активность как причину sleep_data за эту дату.
 - data_completeness: high/medium/low и что отсутствует для уверенных выводов
 
 ## sleep
-Экспертная интерпретация сна (sleep_data): качество, фазы, что мешало восстановлению, связь с утренними метриками.
-Отметь нюансы (поздний отход, мало deep/REM, высокий ЧСС во сне, SpO2 и т.д.) — только значимое.
+Экспертная интерпретация sleep_data за дату D: это ночь с D−1 на D (пробуждение утром D), ДО дневной активности.
+Качество, фазы (deep/REM, ЧСС во сне, SpO2), что мешало восстановлению, связь с утренними метриками.
+Не приписывай этому сну события дня D (тренировки, питание), произошедшие после пробуждения.
 
 ## stress_and_hrv
 Что означает стресс этого дня физиологически (Garmin стресс = HRV, не эмоции; stress_data, all_day_stress).
@@ -387,12 +407,16 @@ VO2/endurance/hill/race predictions (max_metrics, endurance_score, hill_score, r
 ## optional_context
 lifestyle_logging_data, menstrual_data_for_date, all_day_events, fitnessage_data, user_summary,
 stats_and_body, goals/user_profile — если есть и влияет на выводы; иначе кратко «нет значимых данных».
+Если переданы субъективные заметки пользователя — используй их для объяснения аномалий (бег, ванна, поздняя еда,
+самочувствие) и свяжи с метриками Garmin; не противоречь заметкам без явного указания на расхождение с данными.
 
 ## day_timeline
-Хронология дня связным повествованием: сон → утро → активность → вечер. Ключевые поворотные моменты с цифрами.
+Хронология строго по Garmin: (1) сон ночи D−1→D, пробуждение утром D → (2) утро и дневная активность D → (3) вечер D.
+Не ставь сон после тренировок/питания дня D. Ключевые моменты с цифрами.
 
 ## correlations_and_insights
 Минимум 5 конкретных выводов вида «когда X, то Y, потому что Z» — с нюансами и оговорками.
+Не делай выводов «активность D ухудшила сон D» — sleep_data за D был до активности. Связь нагрузки/питания D с сном формулируй как влияние на предстоящую ночь D→D+1 (гипотеза).
 Отдельно: неочевидные наблюдения, которые легко пропустить при поверхностном просмотре.
 
 ## problems_and_risks
@@ -429,6 +453,7 @@ def _call_gemini(
     temperature: float = 0.4,
     max_output_tokens: int | None = None,
     max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
+    daily_notes: str | None = None,
 ) -> dict[str, Any]:
     if genai is None or types is None:
         return {"ok": False, "error": "gemini_sdk_not_installed", "analysis": None}
@@ -443,7 +468,18 @@ def _call_gemini(
         }
 
     text_context, meta = build_prompt_context(metrics, max_input_tokens=max_input_tokens)
-    user_content = user_intro + "\n\n" + text_context
+    if daily_notes and daily_notes.strip():
+        meta = {**meta, "has_daily_notes": True}
+        user_content = (
+            user_intro
+            + "\n\n=== Субъективные заметки пользователя за день ===\n"
+            + daily_notes.strip()
+            + "\n\n=== Данные Garmin Connect ===\n\n"
+            + text_context
+        )
+    else:
+        meta = {**meta, "has_daily_notes": False}
+        user_content = user_intro + "\n\n" + text_context
     cfg_kwargs: dict[str, Any] = {
         "system_instruction": system_instruction,
         "temperature": temperature,
@@ -498,6 +534,8 @@ def analyze_garmin_metrics(metrics: dict[str, Any], model: str | None = None) ->
 def analyze_garmin_metrics_detailed(
     metrics: dict[str, Any],
     model: str | None = None,
+    *,
+    daily_notes: str | None = None,
 ) -> dict[str, Any]:
     """
     Экспертный архивный анализ за день для GCS archive/.
@@ -509,12 +547,16 @@ def analyze_garmin_metrics_detailed(
         model=model,
         system_instruction=SYSTEM_PROMPT_DETAILED,
         user_intro=(
-            "Ниже сырые данные Garmin Connect за один день — используй их только как источник для анализа. "
-            "Сформируй экспертный отчёт по обязательной структуре: выводы, связи, нюансы, гипотезы. "
-            "Не переписывай сырые данные и ряды в ответ. "
-            "Этот текст позже объединят с другими днями для анализа трендов за неделю/месяц."
+            "Ниже сырые данные Garmin Connect за один календарный день. "
+            "Помни: sleep_data за эту дату — прошедшая ночь (до пробуждения), активность и заметки — после пробуждения. "
+            "Если есть субъективные заметки — учитывай их для пульса, стресса и Body Battery в течение дня; "
+            "не объясняй ими sleep_data за эту же дату как последствие дневных событий. "
+            "Сформируй экспертный отчёт по обязательной структуре. "
+            "Не переписывай сырые данные. "
+            "Текст позже объединят для анализа трендов за неделю/месяц."
         ),
         temperature=0.25,
+        daily_notes=daily_notes,
         max_output_tokens=8192,
     )
 
@@ -594,8 +636,8 @@ SYSTEM_PROMPT_FOOD = """Ты — диетолог-нутрициолог с эк
 timing приёмов пищи (если видно по контексту фото/имени файла).
 
 ## correlations_with_health
-Как питание дня может влиять на сон, стресс, восстановление, энергию, микробиом и метаболическое здоровье
-(гипотезы, не медицинские диагнозы).
+Как питание дня D может влиять на предстоящий сон (ночь D→D+1), стресс и восстановление в течение D и на следующий день —
+не на sleep_data за D (он уже был утром, до приёмов пищи D). Гипотезы, не медицинские диагнозы.
 
 ## evidence_based_recommendations
 5–8 конкретных рекомендаций на завтра и ближайшую неделю, основанных на лучших практиках нутрициологии:
@@ -608,6 +650,10 @@ timing приёмов пищи (если видно по контексту фо
 ## data_gaps
 Что невозможно оценить по фото (скрытые ингредиенты, масло, соусы, точный вес, напитки без фото).
 
+## coverage_warning
+Только если анализ неполный (есть пропущенные фото в манифесте): что не учтено и как это ограничивает выводы.
+Если все фото обработаны — «полное покрытие».
+
 ## facts_for_aggregation
 Компактные факты для merge — одна строка:
 - FACT | category=nutrition | nutrient=... | amount=... | pct_rda=... | severity=... | note=...
@@ -619,7 +665,50 @@ timing приёмов пищи (если видно по контексту фо
 - Не придумывай блюда, которых не видно на фото.
 - Если несколько фото одного приёма — объединяй, не дублируй калории.
 - Учитывай скрытые калории (масло, соусы) как диапазон, если не видны.
-- Рекомендации по микробиому — evidence-informed, без псевдонаучных claims."""
+- Рекомендации по микробиому — evidence-informed, без псевдонаучных claims.
+
+ЧТЕНИЕ ЭТИКЕТОК И УПАКОВКИ (критично — не галлюцинируй):
+- Если на фото видна таблица пищевой ценности — прочитай её буквально: бренд, название продукта, значения «на 100 г/100 мл»
+  и «на порцию», если указаны. Не подставляй типичные значения «похожего» продукта.
+- Натуральный кефир/йогурт без сахара ≠ сладкий питьевой йогурт — ориентируйся на название и цифры на этикетке.
+- Пересчёт: (граммы/мл порции ÷ 100) × значение на 100 г. Покажи формулу в meals_breakdown для упакованных продуктов.
+- Если этикетка частично нечитаема — дай диапазон и пометь confidence: low; не выдавай точные цифры за факт.
+- Объёмы «на глаз» (сливки в кофе, масло): используй визуальные подсказки (цвет, слои, размер посуды);
+  при сомнении — диапазон (например 25–35 мл), не завышай до верхней границы без оснований.
+
+ПОЛНОТА АНАЛИЗА (критично):
+- Обработай КАЖДОЕ переданное фото по порядку, прежде чем считать daily_totals.
+- В meta укажи photos_analyzed = число обработанных фото и перечисли имя файла + что на каждом.
+- Если в манифесте указаны пропущенные файлы или photos_found > photos_analyzed — секция ## coverage_warning обязательна:
+  перечисли что не проанализировано; пометь overall confidence: low; НЕ делай выводов о критическом дефиците
+  (клетчатка, белок, калории, микробиом) по неполным данным — только по проанализированным фото.
+- daily_totals и вердикты по дефицитам — только если analysis_complete или явно оговорено «по N из M фото»."""
+
+
+def _food_photo_manifest_text(fetch_meta: dict[str, Any] | None, photos: list[dict[str, Any]]) -> str:
+    """Текст манифеста: сколько фото в папке, что передано, что пропущено."""
+    if not fetch_meta:
+        names = [p.get("name") or f"photo_{i}" for i, p in enumerate(photos, 1)]
+        return (
+            f"Передано фото: {len(photos)}.\n"
+            f"Список файлов (обработай каждый): {', '.join(names)}."
+        )
+
+    images_found = int(fetch_meta.get("images_found") or fetch_meta.get("photo_count") or len(photos))
+    skipped = fetch_meta.get("skipped") or []
+    analyzed_names = [p.get("name") or "?" for p in photos]
+    lines = [
+        f"В папке Drive найдено изображений: {images_found}",
+        f"Передано в анализ: {len(photos)}",
+        f"analysis_complete: {bool(fetch_meta.get('analysis_complete', not skipped and images_found == len(photos)))}",
+        "Файлы в этом запросе (обработай каждый по порядку):",
+        *[f"  {i}. {name}" for i, name in enumerate(analyzed_names, 1)],
+    ]
+    if skipped:
+        lines.append("НЕ переданы в модель (итоги дня будут неполными — см. coverage_warning):")
+        for s in skipped:
+            lines.append(f"  - {s.get('name', '?')}: {s.get('reason', 'skipped')}")
+    return "\n".join(lines)
 
 
 def analyze_food_photos(
@@ -628,10 +717,14 @@ def analyze_food_photos(
     day_label: str,
     model: str | None = None,
     profile_hint: str | None = None,
+    fetch_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    Анализ фото еды за день через Gemini Vision.
-    photos: [{name, mime_type, data: bytes}, ...]
+    Анализ фото еды за день через Gemini Vision (multimodal).
+
+    В отличие от Gemini в веб-чате с ссылкой на Google Drive (OCR этикеток, лимит ~5 файлов,
+    без «зрения» тарелок), MyBody скачивает байты через Drive API и передаёт Part.from_bytes —
+    полноценный visual analysis каждого фото.
     """
     if genai is None or types is None:
         return {"ok": False, "error": "gemini_sdk_not_installed", "analysis": None}
@@ -642,31 +735,50 @@ def analyze_food_photos(
         return {"ok": False, "error": "no_photos", "analysis": None}
 
     model = model_for_step("food", model)
+    manifest = _food_photo_manifest_text(fetch_meta, photos)
     intro = (
-        f"Дата: {day_label}. Ниже {len(photos)} фото еды за этот день. "
-        "Оцени всё съеденное за день, суммируй нутриенты, сравни с суточными нормами, "
-        "оцени влияние на микробиом и дай рекомендации по лучшим практикам питания. "
-        "Сформируй экспертный отчёт по обязательной структуре из инструкции."
+        f"Дата: {day_label}.\n\n"
+        f"=== Манифест фото ===\n{manifest}\n\n"
+        f"Ниже {len(photos)} изображений. Сначала разбери КАЖДОЕ фото (meals_breakdown), "
+        "затем суммируй daily_totals. "
+        "На упакованных продуктах читай этикетку с фото буквально, не угадывай по категории. "
+        "На фото тарелок и блюд — визуально оценивай состав, объём порций и калории (это полноценные изображения, не OCR). "
+        "Сформируй отчёт по обязательной структуре из инструкции."
     )
     if profile_hint:
         intro += f"\n\nПрофиль пользователя (если релевантно для норм): {profile_hint}"
 
     parts: list[Any] = [intro]
+    sent = 0
+    gemini_resized = 0
     for i, photo in enumerate(photos, start=1):
         name = photo.get("name") or f"photo_{i}"
         mime = photo.get("mime_type") or "image/jpeg"
         data = photo.get("data")
         if not data:
             continue
-        parts.append(f"\n--- Фото {i}: {name} ---")
+        data, mime, gemini_adj = drive_client.prepare_photo_for_gemini(data, mime)
+        if gemini_adj != "none":
+            gemini_resized += 1
+        sent += 1
+        parts.append(f"\n--- Фото {i} из {len(photos)}: {name} ---")
         parts.append(types.Part.from_bytes(data=data, mime_type=mime))
 
-    meta = {"photo_count": len(photos), "day": day_label}
+    images_found = int((fetch_meta or {}).get("images_found") or sent)
+    meta = {
+        "photo_count": sent,
+        "photos_found_in_folder": images_found,
+        "photos_skipped_count": int((fetch_meta or {}).get("photos_skipped_count") or 0),
+        "analysis_complete": bool((fetch_meta or {}).get("analysis_complete", sent == images_found)),
+        "gemini_inline_resized_count": gemini_resized,
+        "delivery_mode": "inline_bytes_vision",
+        "day": day_label,
+    }
     return _generate_with_retry(
         contents=parts,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT_FOOD,
-            temperature=0.2,
+            temperature=0.15,
             max_output_tokens=16384,
         ),
         model=model,
@@ -675,18 +787,24 @@ def analyze_food_photos(
 
 
 SYSTEM_PROMPT_COMBINED = """Ты — персональный health-coach: спортивная медицина, сон, восстановление и нутрициология.
-Тебе передают два источника за ОДИН календарный день:
+Тебе передают три источника за ОДИН календарный день:
 1) сырые данные Garmin Connect;
-2) архивный экспертный анализ питания (уже посчитан по фото еды).
+2) архивный экспертный анализ питания (уже посчитан по фото еды);
+3) субъективные заметки пользователя (контекст дня: активность, ванна, самочувствие и т.д.).
 
-Задача: СОГЛАСОВАТЬ Garmin и питание, найти связи, противоречия и приоритеты.
+Задача: СОГЛАСОВАТЬ Garmin, питание и заметки, найти связи, противоречия и приоритеты.
 Этот отчёт пойдёт пользователю в email и HTML — пиши ясно, структурированно, без сырых JSON и без
 переписывания входных данных. Цифры — только как доказательства к выводам.
 
+""" + GARMIN_DAY_CHRONOLOGY + """
 ОБЯЗАТЕЛЬНАЯ СТРУКТУРА (Markdown):
 
 ## executive_summary
-3–5 предложений: как прошёл день в целом (восстановление + нагрузка + питание).
+3–5 предложений: (1) прошедшая ночь и пробуждение, (2) как прошёл день после пробуждения (нагрузка, питание, заметки).
+Не пиши, что дневная активность «несмотря на это» ухудшила сон за эту дату — сон в Garmin за D был до активности D.
+
+## user_notes_context
+Кратко: что пользователь сам отметил за день и как это может объяснить метрики Garmin (пульс, стресс, сон, Body Battery).
 
 ## garmin_key_points
 Главное из Garmin: сон, стресс/HRV, Body Battery, нагрузка — списком, каждый пункт с тегом [good|warn|neutral|bad] и **меткой:** (см. правила оценки ниже).
@@ -695,8 +813,9 @@ SYSTEM_PROMPT_COMBINED = """Ты — персональный health-coach: сп
 Главное из питания — списком с тегами и **метками:** как выше.
 
 ## cross_domain_insights
-Минимум 4 связи «Garmin ↔ питание», например:
-- поздний/тяжёлый ужин ↔ сон/ЧСС/стресс;
+Минимум 4 связи «Garmin ↔ питание ↔ заметки», с соблюдением хронологии Garmin:
+- нагрузка/питание/заметки дня D ↔ метрики днём D и Body Battery после пробуждения (не ↔ sleep_data за D как следствие);
+- поздний/тяжёлый ужин D ↔ возможный сон ночи D→D+1 (гипотеза на будущее), не ↔ утренний сон D;
 - недобор белка/клетчатки ↔ восстановление;
 - перегруз ↔ калории/углеводы;
 - кофеин/алкоголь (если упомянуты в питании) ↔ сон/HRV.
@@ -727,7 +846,8 @@ SYSTEM_PROMPT_COMBINED = """Ты — персональный health-coach: сп
 
 Правила:
 - Язык: русский.
-- Если анализа питания нет — явно укажи и опирайся только на Garmin.
+- Если анализа питания нет — явно укажи и опирайся на Garmin и заметки.
+- Если заметок нет — явно укажи и опирайся на Garmin и питание.
 - Стресс Garmin = HRV-метрика, не психология.
 - Не дублируй длинные архивные тексты — синтезируй.
 - Не ставь медицинских диагнозов."""
@@ -737,6 +857,7 @@ def analyze_daily_combined(
     metrics: dict[str, Any],
     *,
     food_analysis: str | None,
+    daily_notes: str | None = None,
     day_label: str,
     model: str | None = None,
 ) -> dict[str, Any]:
@@ -757,17 +878,30 @@ def analyze_daily_combined(
 
     model = model_for_step("combined", model)
     text_context, meta = build_prompt_context(metrics)
-    meta = {**meta, "day": day_label, "has_food_analysis": bool(food_analysis and food_analysis.strip())}
+    meta = {
+        **meta,
+        "day": day_label,
+        "has_food_analysis": bool(food_analysis and food_analysis.strip()),
+        "has_daily_notes": bool(daily_notes and daily_notes.strip()),
+    }
 
     food_block = (
         food_analysis.strip()
         if food_analysis and food_analysis.strip()
         else "нет архивного анализа питания за этот день"
     )
+    notes_block = (
+        daily_notes.strip()
+        if daily_notes and daily_notes.strip()
+        else "нет субъективных заметок пользователя за этот день"
+    )
     user_content = (
         f"Дата: {day_label}.\n\n"
-        "Ниже сырые данные Garmin Connect за день и архивный экспертный анализ питания за тот же день. "
-        "Согласуй оба источника и сформируй итоговый отчёт по структуре из инструкции.\n\n"
+        "Ниже Garmin, питание и заметки за этот календарный день. "
+        "sleep_data за эту дату = прошедшая ночь (до пробуждения); активность, питание и заметки = после пробуждения. "
+        "Согласуй источники с правильной хронологией и сформируй отчёт по структуре из инструкции.\n\n"
+        "=== Субъективные заметки пользователя ===\n"
+        f"{notes_block}\n\n"
         "=== Архивный экспертный анализ питания ===\n"
         f"{food_block}\n\n"
         "=== Сырые данные Garmin Connect ===\n"

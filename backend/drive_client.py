@@ -13,6 +13,7 @@ Share отдельной папки на «Мой диск» даёт list/get, 
     DRIVE_SHORTS_FOLDER_ID    — папка Outcomes/Shorts
     DRIVE_DETAILED_FOLDER_ID  — папка Outcomes/Detailed
     DRIVE_MEALS_FOLDER_ID     — корневая папка Meals (чтение фото; подпапки YYYY.MM.DD)
+    DRIVE_NOTES_FOLDER_ID     — папка Notes (файлы YYYY.MM.DD — Google Docs или текст)
 """
 from __future__ import annotations
 
@@ -247,8 +248,193 @@ def _meals_folder_id() -> str:
 
 
 def meals_subfolder_name(day: str) -> str:
-    """ISO-дата YYYY-MM-DD → имя подпапки Meals на Drive (YYYY.MM.DD)."""
+    """ISO-дата YYYY-MM-DD → метка дня на Drive (YYYY.MM.DD) — подпапка Meals или имя файла Notes."""
     return day.strip().replace("-", ".")
+
+
+def is_notes_configured() -> bool:
+    """Drive API доступен и задан id папки Notes."""
+    if build is None:
+        return False
+    return bool(os.environ.get("DRIVE_NOTES_FOLDER_ID", "").strip())
+
+
+def _notes_folder_id() -> str:
+    return os.environ.get("DRIVE_NOTES_FOLDER_ID", "").strip()
+
+
+_GOOGLE_EXPORT_MIMES: dict[str, str] = {
+    "application/vnd.google-apps.document": "text/plain",
+    "application/vnd.google-apps.spreadsheet": "text/csv",
+}
+
+
+def _notes_max_chars() -> int:
+    try:
+        return max(1000, int(os.environ.get("DRIVE_NOTES_MAX_CHARS", "32000")))
+    except ValueError:
+        return 32000
+
+
+def _read_drive_file_text(service, file_id: str, mime_type: str) -> tuple[str | None, str | None]:
+    """Читает текст файла Drive (Google Docs через export, обычные — download)."""
+    export_mime = _GOOGLE_EXPORT_MIMES.get(mime_type or "")
+    try:
+        if export_mime:
+            raw = service.files().export(fileId=file_id, mimeType=export_mime).execute()
+            if isinstance(raw, bytes):
+                text = raw.decode("utf-8", errors="replace")
+            else:
+                text = str(raw)
+            return text, None
+        downloaded = download_file_bytes(file_id)
+        if not downloaded.get("ok"):
+            return None, downloaded.get("error") or "drive_download_failed"
+        data = downloaded.get("data") or b""
+        return data.decode("utf-8", errors="replace"), None
+    except HttpError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, str(e)
+
+
+def fetch_day_notes(day: str) -> dict[str, Any]:
+    """
+    Загружает заметки за день из папки Notes: файл с именем YYYY.MM.DD (Google Docs или текст).
+    """
+    if build is None:
+        return {"ok": False, "error": "drive_sdk_not_installed"}
+    root_id = _notes_folder_id()
+    if not root_id:
+        return {"ok": False, "error": "drive_notes_folder_not_configured"}
+
+    filename = meals_subfolder_name(day)
+    out: dict[str, Any] = {
+        "ok": True,
+        "day": day,
+        "filename": filename,
+        "notes_root_id": root_id,
+        "file_found": False,
+        "text": None,
+    }
+
+    try:
+        service = _service()
+        file_id = _find_file_id(service, root_id, filename)
+        if not file_id:
+            return out
+
+        meta = (
+            service.files()
+            .get(fileId=file_id, fields="id,name,mimeType,size", **_FILE_KW)
+            .execute()
+        )
+        mime_type = meta.get("mimeType") or ""
+        text, read_err = _read_drive_file_text(service, file_id, mime_type)
+        if read_err:
+            return {
+                "ok": False,
+                "error": "drive_notes_read_failed",
+                "detail": read_err,
+                "day": day,
+                "filename": filename,
+                "file_id": file_id,
+                "mime_type": mime_type,
+            }
+        if text is None:
+            text = ""
+
+        max_chars = _notes_max_chars()
+        truncated = False
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n…(заметки обрезаны по лимиту)…"
+            truncated = True
+
+        out.update(
+            {
+                "file_found": True,
+                "file_id": file_id,
+                "mime_type": mime_type,
+                "size": int(meta.get("size") or 0),
+                "char_count": len(text),
+                "truncated": truncated,
+                "text": text.strip(),
+            }
+        )
+        return out
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        return {
+            "ok": False,
+            "error": "drive_notes_fetch_failed",
+            "detail": str(e),
+            "http_status": status,
+            "day": day,
+            "filename": filename,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "drive_notes_fetch_failed",
+            "detail": str(e),
+            "day": day,
+            "filename": filename,
+        }
+
+
+def probe_notes_access(day: str | None = None) -> dict[str, Any]:
+    """Диагностика чтения папки Notes и файла за день."""
+    if build is None:
+        return {"ok": False, "error": "drive_sdk_not_installed"}
+
+    root_id = _notes_folder_id()
+    if not root_id:
+        return {"ok": False, "error": "drive_notes_folder_not_configured"}
+
+    auth_source = "json" if os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "").strip() else "adc"
+    try:
+        creds = _credentials()
+        sa_email = _credential_email(creds)
+        service = _service()
+    except Exception as e:
+        return {"ok": False, "error": "credentials_failed", "detail": str(e), "auth_source": auth_source}
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "auth_source": auth_source,
+        "service_account_email": sa_email,
+        "notes_folder_id": root_id,
+    }
+
+    try:
+        meta = service.files().get(fileId=root_id, fields="id,name,mimeType", **_FILE_KW).execute()
+        result["notes_folder_name"] = meta.get("name")
+        result["notes_folder_visible"] = True
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        result["ok"] = False
+        result["notes_folder_visible"] = False
+        result["error"] = str(e)
+        result["http_status"] = status
+        return result
+
+    if day:
+        fetch = fetch_day_notes(day)
+        preview = (fetch.get("text") or "")[:200]
+        result["day_probe"] = {
+            "day": day,
+            "filename": fetch.get("filename"),
+            "file_found": fetch.get("file_found", False),
+            "char_count": fetch.get("char_count", 0),
+            "mime_type": fetch.get("mime_type"),
+            "preview": preview,
+            "ok": fetch.get("ok"),
+            "error": fetch.get("error"),
+        }
+        if not fetch.get("ok"):
+            result["ok"] = False
+
+    return result
 
 
 def _escape_drive_query(value: str) -> str:
@@ -305,9 +491,9 @@ def _meals_fetch_limits() -> dict[str, int]:
             return default
 
     return {
-        "max_photos": _int("DRIVE_MEALS_MAX_PHOTOS", 12),
+        "max_photos": _int("DRIVE_MEALS_MAX_PHOTOS", 24),
         "max_bytes_per_file": _int("DRIVE_MEALS_MAX_BYTES", 12_000_000),
-        "max_total_bytes": _int("DRIVE_MEALS_MAX_TOTAL_BYTES", 60_000_000),
+        "max_total_bytes": _int("DRIVE_MEALS_MAX_TOTAL_BYTES", 80_000_000),
         "max_download_bytes": _int("DRIVE_MEALS_MAX_DOWNLOAD_BYTES", 20_000_000),
         "compress_if_bytes": _int("MEALS_COMPRESS_IF_BYTES", 4_000_000),
         "compress_soft_edge": _int("MEALS_COMPRESS_SOFT_EDGE", 2560),
@@ -343,6 +529,36 @@ def _encode_meal_image(
             return out, "image/jpeg", len(out)
     except Exception:
         return data, mime_type, len(data)
+
+
+def _gemini_inline_max_bytes() -> int:
+    try:
+        return max(500_000, int(os.environ.get("GEMINI_INLINE_IMAGE_MAX_BYTES", "7000000")))
+    except ValueError:
+        return 7_000_000
+
+
+def prepare_photo_for_gemini(data: bytes, mime_type: str) -> tuple[bytes, str, str]:
+    """
+    Укладывает фото в лимит inline Gemini API (~7 MB на файл).
+    Возвращает (bytes, mime_type, adjustment): none | soft | hard | gemini.
+    """
+    max_b = _gemini_inline_max_bytes()
+    if not data or len(data) <= max_b:
+        return data, mime_type, "none"
+
+    limits = _meals_fetch_limits()
+    last: tuple[bytes, str, int] = (data, mime_type, len(data))
+    for label, edge, quality in (
+        ("soft", limits["compress_soft_edge"], limits["compress_soft_quality"]),
+        ("hard", limits["compress_hard_edge"], limits["compress_hard_quality"]),
+        ("gemini", 1280, 85),
+        ("gemini", 1280, 78),
+    ):
+        last = _encode_meal_image(data, mime_type, max_edge=edge, quality=quality)
+        if last[2] <= max_b:
+            return last[0], last[1], label
+    return last[0], last[1], "gemini"
 
 
 def _prepare_meal_image(
@@ -535,7 +751,10 @@ def fetch_day_meal_photos(
             )
 
         out["photos"] = photos
+        out["images_found"] = len(image_entries)
         out["photo_count"] = len(photos)
+        out["photos_skipped_count"] = len(out["skipped"])
+        out["analysis_complete"] = len(out["skipped"]) == 0 and len(photos) == len(image_entries)
         out["total_bytes"] = total_bytes
         return out
     except HttpError as e:

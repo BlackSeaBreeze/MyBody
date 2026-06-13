@@ -63,7 +63,7 @@ jobs:
             --allow-unauthenticated \
             --memory=1Gi \
             --timeout=540 \
-            --set-env-vars=CRON_SECRET=${{ secrets.CRON_SECRET }},SMTP_HOST=smtp.gmail.com,SMTP_PORT=587,REPORT_TIMEZONE=Europe/Dublin,GEMINI_INTER_CALL_DELAY_SEC=65,GEMINI_MAX_RETRIES=4,GEMINI_MODEL_FOOD=gemini-2.0-flash,GEMINI_MODEL_COMBINED=gemini-2.0-flash,GCS_REPORTS_BUCKET=mybody-dev-env-reports,DRIVE_MEALS_FOLDER_ID=1D--DhmDQhFVhoHxnykuC-B2uapJf6rbx,DRIVE_MEALS_MAX_PHOTOS=12,MEALS_IMAGE_COMPRESS=auto \
+            --set-env-vars=CRON_SECRET=${{ secrets.CRON_SECRET }},SMTP_HOST=smtp.gmail.com,SMTP_PORT=587,REPORT_TIMEZONE=Europe/Dublin,GEMINI_INTER_CALL_DELAY_SEC=65,GEMINI_MAX_RETRIES=4,GEMINI_MODEL_FOOD=gemini-2.5-flash,GEMINI_MODEL_COMBINED=gemini-2.0-flash,GCS_REPORTS_BUCKET=mybody-dev-env-reports,DRIVE_MEALS_FOLDER_ID=1D--DhmDQhFVhoHxnykuC-B2uapJf6rbx,DRIVE_NOTES_FOLDER_ID=1qQWdWahgEqmYnoPhDHAN2WbEE62t7pis,DRIVE_MEALS_MAX_PHOTOS=24,MEALS_IMAGE_COMPRESS=auto \
             --set-secrets=GARMIN_EMAIL=garmin-email:latest,GARMIN_PASSWORD=garmin-password:latest,GEMINI_API_KEY=gemini-api-key:latest,GARMINTOKENS_BASE64=garmin-tokens-base64:latest,SMTP_PASSWORD=smtp-password:latest
         env:
           CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}

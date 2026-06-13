@@ -458,6 +458,34 @@ def _profile_hint_from_metrics(metrics: dict) -> str | None:
     return "; ".join(parts) if parts else None
 
 
+def _load_daily_notes(day_label: str, result: dict) -> str | None:
+    """Читает заметки за день из Drive Notes/YYYY.MM.DD; возвращает текст или None."""
+    if not drive_client.is_notes_configured():
+        result["notes_skipped"] = "drive_notes_not_configured"
+        return None
+
+    notes = drive_client.fetch_day_notes(day_label)
+    result["notes_fetch"] = {
+        "ok": notes.get("ok"),
+        "filename": notes.get("filename"),
+        "file_found": notes.get("file_found"),
+        "char_count": notes.get("char_count", 0),
+        "mime_type": notes.get("mime_type"),
+        "error": notes.get("error"),
+    }
+    if not notes.get("ok"):
+        logger.error("Notes fetch failed: %s", notes.get("error"))
+        return None
+    if not notes.get("file_found"):
+        result["notes_skipped"] = "file_not_found"
+        return None
+    text = notes.get("text")
+    if not text or not str(text).strip():
+        result["notes_skipped"] = "empty_file"
+        return None
+    return str(text).strip()
+
+
 def _save_food_analysis(
     *,
     day_label: str,
@@ -476,9 +504,21 @@ def _save_food_analysis(
         "ok": meals.get("ok"),
         "folder_name": meals.get("folder_name"),
         "folder_found": meals.get("folder_found"),
+        "images_found": meals.get("images_found", 0),
         "photo_count": meals.get("photo_count", 0),
+        "photos_skipped_count": meals.get("photos_skipped_count", 0),
+        "analysis_complete": meals.get("analysis_complete", True),
+        "skipped": meals.get("skipped"),
         "error": meals.get("error"),
     }
+    if meals.get("photos_skipped_count"):
+        logger.warning(
+            "Meals: %s/%s photos skipped for %s: %s",
+            meals.get("photos_skipped_count"),
+            meals.get("images_found"),
+            day_label,
+            meals.get("skipped"),
+        )
     if not meals.get("ok"):
         logger.error("Meals fetch failed: %s", meals.get("error"))
         return
@@ -498,6 +538,7 @@ def _save_food_analysis(
         day_label=day_label,
         model=model,
         profile_hint=_profile_hint_from_metrics(metrics),
+        fetch_meta=meals,
     )
     result["food_analysis_ok"] = bool(food.get("ok"))
     _note_gemini_failure(result, food, "food")
@@ -537,9 +578,9 @@ def daily_report(
     иначе сегодня (cron в 23:45). Явно: ?day=YYYY-MM-DD.
 
     Порядок:
-    1) Garmin → один Gemini-вызов → archive/vb-….md (сырые метрики остаются в памяти)
+    1) Garmin + заметки за день → Gemini → archive/vb-….md
     2) Фото еды → archive/vb-…-food.md
-    3) Сырые Garmin + последний food-архив за день → итоговый Gemini → outcomes/vb-….html + email
+    3) Garmin + food-архив + заметки → итоговый Gemini → outcomes/vb-….html + email
 
     Вызов защищён: при заданном CRON_SECRET требуется заголовок X-Cron-Secret.
     """
@@ -578,10 +619,15 @@ def daily_report(
     html_body = ""
     combined: dict = {"ok": False, "error": "not_run"}
     food_archive: dict[str, Any] = {}
+    daily_notes = _load_daily_notes(day_label, result)
 
     if save_reports and storage_client.is_configured():
-        # 1) Garmin — только архивный экспертный анализ (один вызов Gemini)
-        detailed = gemini_client.analyze_garmin_metrics_detailed(metrics, model=gemini_override)
+        # 1) Garmin + заметки — архивный экспертный анализ (один вызов Gemini)
+        detailed = gemini_client.analyze_garmin_metrics_detailed(
+            metrics,
+            model=gemini_override,
+            daily_notes=daily_notes,
+        )
         result["detailed_analysis_ok"] = bool(detailed.get("ok"))
         _note_gemini_failure(result, detailed, "archive")
         if detailed.get("ok"):
@@ -622,6 +668,15 @@ def daily_report(
         food_analysis_text: str | None = None
         if food_archive.get("ok"):
             food_analysis_text = report_formats.extract_analysis_section(food_archive["content"])
+            mf = result.get("meals_fetch") or {}
+            if mf.get("photos_skipped_count") or mf.get("analysis_complete") is False:
+                skipped_n = mf.get("photos_skipped_count") or 0
+                found_n = mf.get("images_found") or "?"
+                food_analysis_text = (
+                    f"⚠ Анализ питания неполный: проанализировано {mf.get('photo_count')} из {found_n} фото "
+                    f"({skipped_n} пропущено при загрузке). Выводы по калориям/дефицитам могут быть занижены.\n\n"
+                    + food_analysis_text
+                )
             result["food_archive_used"] = {
                 "object": food_archive.get("object"),
                 "gs_uri": food_archive.get("gs_uri"),
@@ -637,6 +692,7 @@ def daily_report(
         combined = gemini_client.analyze_daily_combined(
             metrics,
             food_analysis=food_analysis_text,
+            daily_notes=daily_notes,
             day_label=day_label,
             model=gemini_override,
         )
@@ -731,6 +787,21 @@ def meals_probe(
         raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
 
     result = drive_client.probe_meals_access(day=day)
+    status = 200 if result.get("ok") else 502
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/internal/notes-probe")
+def notes_probe(
+    day: str | None = None,
+    x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
+):
+    """Диагностика чтения папки Notes на Google Drive (опционально — файл за day=YYYY-MM-DD)."""
+    secret = os.environ.get("CRON_SECRET", "").strip()
+    if secret and x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
+
+    result = drive_client.probe_notes_access(day=day)
     status = 200 if result.get("ok") else 502
     return JSONResponse(result, status_code=status)
 
