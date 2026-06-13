@@ -61,6 +61,7 @@ jobs:
             --region ${{ env.REGION }} \
             --platform managed \
             --allow-unauthenticated \
-            --set-secrets=GARMIN_EMAIL=garmin-email:latest,GARMIN_PASSWORD=garmin-password:latest,GEMINI_API_KEY=gemini-api-key:latest
+            --set-env-vars=CRON_SECRET=${{ secrets.CRON_SECRET }},SMTP_HOST=smtp.gmail.com,SMTP_PORT=587 \
+            --set-secrets=GARMIN_EMAIL=garmin-email:latest,GARMIN_PASSWORD=garmin-password:latest,GEMINI_API_KEY=gemini-api-key:latest,GARMINTOKENS_BASE64=garmin-tokens-base64:latest,SMTP_PASSWORD=smtp-password:latest
         env:
           CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}

@@ -52,30 +52,41 @@ def get_client() -> tuple[Any | None, str | None, str | None]:
     """
     Создаёт и логинит клиент Garmin.
     Успех: (api, None, None). Ошибка: (None, код, detail) — detail для отладки (текст исключения).
+
+    Приоритет авторизации:
+    1. GARMINTOKENS_BASE64 — готовый токен (base64-строка от garth). Логин без SSO,
+       подходит для Cloud Run (токен берётся из Secret Manager). Cloudflare/429 не задействуются.
+    2. GARMIN_EMAIL / GARMIN_PASSWORD — полноценный SSO-вход (может упереться в 429).
     """
     if Garmin is None:
         return None, "garmin_sdk_missing", "garminconnect not installed"
+
+    token_b64 = os.environ.get("GARMINTOKENS_BASE64", "").strip()
     email = os.environ.get("GARMIN_EMAIL", "").strip()
     password = os.environ.get("GARMIN_PASSWORD", "").strip()
-    if not email or not password:
-        return None, "garmin_not_configured", "GARMIN_EMAIL / GARMIN_PASSWORD missing"
-    store = _garmin_tokenstore_dir()
-    try:
-        store.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+
+    if not token_b64 and (not email or not password):
+        return None, "garmin_not_configured", "no GARMINTOKENS_BASE64 and no GARMIN_EMAIL/PASSWORD"
 
     try:
-        api = Garmin(email, password)
-        # Всегда передаём каталог: garminconnect 0.3+ сам грузит/сохраняет garmin_tokens.json
-        # и после успешного парольного входа вызывает client.dump (повторный SSO реже нужен).
-        api.login(tokenstore=str(store))
-        # garminconnect < 0.3 (garth): дополнительно сохранить oauth-файлы, если есть .garth
-        if hasattr(api, "garth") and api.garth is not None:
+        api = Garmin(email or None, password or None)
+        if token_b64:
+            # login() трактует строку длиной > 512 как сами токены (client.loads).
+            api.login(tokenstore=token_b64)
+        else:
+            store = _garmin_tokenstore_dir()
             try:
-                api.garth.dump(str(store))
+                store.mkdir(parents=True, exist_ok=True)
             except OSError:
                 pass
+            # garminconnect 0.3+ сам грузит/сохраняет garmin_tokens.json в каталоге.
+            api.login(tokenstore=str(store))
+            # garminconnect < 0.3 (garth): дополнительно сохранить oauth-файлы.
+            if hasattr(api, "garth") and api.garth is not None:
+                try:
+                    api.garth.dump(str(store))
+                except OSError:
+                    pass
         return api, None, None
     except GarminConnectTooManyRequestsError as e:
         return None, "garmin_rate_limited", _err_detail(e)
@@ -232,6 +243,121 @@ _GLOBAL_METRIC_METHODS = (
 )
 
 
+def _client_error_payload(client_err: str | None, client_detail: str | None) -> dict[str, Any]:
+    """Единый формат ответа об ошибке логина (используется во всех fetch-функциях)."""
+    out: dict[str, Any] = {"ok": False, "error": client_err, "metrics_by_day": None}
+    if client_detail:
+        out["detail"] = client_detail
+    if client_err == "garmin_rate_limited":
+        out["hint"] = (
+            "Garmin SSO временно ограничил входы (429). Подождите 15–60 мин, "
+            "не жмите Execute подряд. После первого успешного входа сессия кэшируется в .garmin-tokens."
+        )
+    if client_err == "garmin_auth_failed" and client_detail and "MFA" in client_detail:
+        out["hint"] = (
+            "Аккаунт требует MFA. Для API без интерактива временно отключите MFA в настройках Garmin "
+            "или используйте официальный demo.py с prompt_mfa. См. README garminconnect."
+        )
+    return out
+
+
+def _collect_metrics_range(api: Any, start: Any, end: Any) -> dict[str, Any]:
+    """Собирает все метрики Garmin за диапазон [start; end] включительно (start, end — date)."""
+    day_count = (end - start).days + 1
+
+    # Активности за период
+    activity_list: list[dict[str, Any]] = []
+    try:
+        activities = api.get_activities_by_date(
+            startdate=start.isoformat(),
+            enddate=end.isoformat(),
+        )
+        if isinstance(activities, list):
+            for a in activities:
+                activity_list.append(dict(a))  # полный объект для Gemini
+    except Exception:
+        pass
+
+    # Все дневные метрики по дням
+    metrics_by_day: dict[str, dict[str, Any]] = {}
+    for d in range(day_count):
+        day = start + timedelta(days=d)
+        day_str = day.isoformat()
+        metrics_by_day[day_str] = {}
+
+        for method_name in _DAILY_METRIC_METHODS:
+            method = getattr(api, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                # методы с (startdate, enddate) вызываем с одним днём
+                if method_name in ("get_body_composition", "get_body_battery"):
+                    result = method(day_str, day_str)
+                else:
+                    result = method(day_str)
+                if result is not None:
+                    key = method_name.replace("get_", "", 1)
+                    metrics_by_day[day_str][key] = result
+            except Exception:
+                pass
+
+    # Методы с диапазоном дат: один вызов на весь период
+    start_str = start.isoformat()
+    end_str = end.isoformat()
+    range_metrics: dict[str, Any] = {}
+    for method_name in _RANGE_METRIC_METHODS:
+        method = getattr(api, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            if method_name == "get_race_predictions":
+                result = method(startdate=start_str, enddate=end_str)
+            else:
+                result = method(start_str, end_str)
+            if result is not None:
+                key = method_name.replace("get_", "", 1)
+                range_metrics[key] = result
+        except Exception:
+            pass
+
+    # Глобальные методы (без даты): один вызов
+    global_metrics: dict[str, Any] = {}
+    for method_name in _GLOBAL_METRIC_METHODS:
+        method = getattr(api, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            if method_name == "get_goals":
+                result = method("active", 0, 30)
+            else:
+                result = method()
+            if result is not None:
+                key = method_name.replace("get_", "", 1)
+                global_metrics[key] = result
+        except Exception:
+            pass
+
+    # Лактатный порог (спец. сигнатура: latest=True)
+    try:
+        lt = getattr(api, "get_lactate_threshold", None)
+        if callable(lt):
+            result = lt(latest=True)
+            if result is not None:
+                global_metrics["lactate_threshold"] = result
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "activities": activity_list,
+        "metrics_by_day": metrics_by_day,
+        "range_metrics": range_metrics,
+        "global_metrics": global_metrics,
+    }
+
+
 def fetch_all_metrics(days: int = 7) -> dict[str, Any]:
     """
     Загружает все доступные метрики Garmin за последние days дней.
@@ -241,126 +367,31 @@ def fetch_all_metrics(days: int = 7) -> dict[str, Any]:
     """
     api, client_err, client_detail = get_client()
     if api is None:
-        out: dict[str, Any] = {
-            "ok": False,
-            "error": client_err,
-            "metrics_by_day": None,
-        }
-        if client_detail:
-            out["detail"] = client_detail
-        if client_err == "garmin_rate_limited":
-            out["hint"] = (
-                "Garmin SSO временно ограничил входы (429). Подождите 15–60 мин, "
-                "не жмите Execute подряд. После первого успешного входа сессия кэшируется в .garmin-tokens."
-            )
-        if client_err == "garmin_auth_failed" and client_detail and "MFA" in client_detail:
-            out["hint"] = (
-                "Аккаунт требует MFA. Для API без интерактива временно отключите MFA в настройках Garmin "
-                "или используйте официальный demo.py с prompt_mfa. См. README garminconnect."
-            )
-        return out
-
+        return _client_error_payload(client_err, client_detail)
     try:
         end = datetime.now().date()
         start = end - timedelta(days=days)
-        day_count = (end - start).days + 1
+        return _collect_metrics_range(api, start, end)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "metrics_by_day": None}
 
-        # Активности за период
-        activity_list: list[dict[str, Any]] = []
-        try:
-            activities = api.get_activities_by_date(
-                startdate=start.isoformat(),
-                enddate=end.isoformat(),
-            )
-            if isinstance(activities, list):
-                for a in activities:
-                    activity_list.append(dict(a))  # полный объект для Gemini
-        except Exception:
-            pass
 
-        # Все дневные метрики по дням
-        metrics_by_day: dict[str, dict[str, Any]] = {}
-        for d in range(day_count):
-            day = start + timedelta(days=d)
-            day_str = day.isoformat()
-            metrics_by_day[day_str] = {}
-
-            for method_name in _DAILY_METRIC_METHODS:
-                method = getattr(api, method_name, None)
-                if not callable(method):
-                    continue
-                try:
-                    # методы с (startdate, enddate) вызываем с одним днём
-                    if method_name in ("get_body_composition", "get_body_battery"):
-                        result = method(day_str, day_str)
-                    else:
-                        result = method(day_str)
-                    if result is not None:
-                        key = method_name.replace("get_", "", 1)
-                        if isinstance(result, dict):
-                            metrics_by_day[day_str][key] = result
-                        elif isinstance(result, list):
-                            metrics_by_day[day_str][key] = result
-                        else:
-                            metrics_by_day[day_str][key] = result
-                except Exception:
-                    pass
-
-        # Методы с диапазоном дат: один вызов на весь период
-        start_str = start.isoformat()
-        end_str = end.isoformat()
-        range_metrics: dict[str, Any] = {}
-        for method_name in _RANGE_METRIC_METHODS:
-            method = getattr(api, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                if method_name == "get_race_predictions":
-                    result = method(startdate=start_str, enddate=end_str)
-                else:
-                    result = method(start_str, end_str)
-                if result is not None:
-                    key = method_name.replace("get_", "", 1)
-                    range_metrics[key] = result
-            except Exception:
-                pass
-
-        # Глобальные методы (без даты): один вызов
-        global_metrics: dict[str, Any] = {}
-        for method_name in _GLOBAL_METRIC_METHODS:
-            method = getattr(api, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                if method_name == "get_goals":
-                    result = method("active", 0, 30)
-                else:
-                    result = method()
-                if result is not None:
-                    key = method_name.replace("get_", "", 1)
-                    global_metrics[key] = result
-            except Exception:
-                pass
-
-        # Лактатный порог (спец. сигнатура: latest=True)
-        try:
-            lt = getattr(api, "get_lactate_threshold", None)
-            if callable(lt):
-                result = lt(latest=True)
-                if result is not None:
-                    global_metrics["lactate_threshold"] = result
-        except Exception:
-            pass
-
-        return {
-            "ok": True,
-            "from": start.isoformat(),
-            "to": end.isoformat(),
-            "activities": activity_list,
-            "metrics_by_day": metrics_by_day,
-            "range_metrics": range_metrics,
-            "global_metrics": global_metrics,
-        }
+def fetch_daily_metrics(day: str | None = None) -> dict[str, Any]:
+    """
+    Загружает все метрики за один календарный день (по умолчанию — сегодня).
+    Сон Garmin привязан к дате пробуждения, поэтому данные сна за сегодня — это
+    прошедшая ночь (сон, завершившийся сегодня утром). Подходит для ежедневного
+    отчёта в конце дня (например, 23:55).
+    """
+    api, client_err, client_detail = get_client()
+    if api is None:
+        return _client_error_payload(client_err, client_detail)
+    try:
+        if day:
+            target = datetime.fromisoformat(day).date()
+        else:
+            target = datetime.now().date()
+        return _collect_metrics_range(api, target, target)
     except Exception as e:
         return {"ok": False, "error": str(e), "metrics_by_day": None}
 
@@ -421,3 +452,34 @@ def build_readable_summary(raw: dict[str, Any]) -> dict[str, Any]:
         "activities_count": len(raw.get("activities") or []),
         "days": days_summary,
     }
+
+
+def summary_from_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """
+    Строит удобочитаемую сводку по дням из результата fetch_all_metrics / fetch_daily_metrics
+    (переиспользует build_readable_summary). Удобно для таблицы в email-отчёте.
+    """
+    if not metrics.get("ok"):
+        return {"ok": False, "error": metrics.get("error"), "days": []}
+    by_day = metrics.get("metrics_by_day") or {}
+    stats_by_day: dict[str, Any] = {}
+    sleep_duration_by_day: dict[str, int] = {}
+    for date_str, day in by_day.items():
+        stats = day.get("stats")
+        if isinstance(stats, dict):
+            stats_by_day[date_str] = stats
+        sleep_data = day.get("sleep_data")
+        if isinstance(sleep_data, dict):
+            dto = sleep_data.get("dailySleepDTO") or sleep_data
+            sec = dto.get("sleepTimeSeconds") if isinstance(dto, dict) else None
+            if sec is not None:
+                sleep_duration_by_day[date_str] = int(sec)
+    raw = {
+        "ok": True,
+        "from": metrics.get("from"),
+        "to": metrics.get("to"),
+        "activities": metrics.get("activities") or [],
+        "stats_by_day": stats_by_day,
+        "sleep_duration_by_day": sleep_duration_by_day,
+    }
+    return build_readable_summary(raw)

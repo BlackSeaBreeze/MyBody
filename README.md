@@ -162,8 +162,87 @@ API: <http://localhost:8000>
 - **GET /garmin/view?days=7** — страница с таблицей по дням.
 - **GET /garmin/analyze?days=7** — анализ данных Garmin через **Gemini**: загружаются метрики за период, отправляются в модель, возвращается текст с выводами и рекомендациями. Параметр `model` (по умолчанию **gemini-3-flash-preview**), опционально `days` (1–31). Требуется **GEMINI_API_KEY** (см. раздел Gemini ниже).
 - **POST /internal/garmin-fetch?days=1** — то же для вызова по расписанию. Если задан **CRON_SECRET**, в запросе обязателен заголовок **`X-Cron-Secret`** с тем же значением.
+- **POST /internal/daily-report** — ежедневный отчёт: метрики Garmin за один день (по умолчанию сегодня; сон = прошедшая ночь), анализ через Gemini и **отправка письма** (таблица показателей + анализ) на `MAIL_TO`. Защищён `X-Cron-Secret`. Параметры: `day=YYYY-MM-DD` (необязательно), `model`, `send=false` (сформировать без отправки).
 
 Для ежедневной выгрузки настройте **Cloud Scheduler**: HTTP-запрос на `https://YOUR_SERVICE_URL/internal/garmin-fetch?days=1` с заголовком `X-Cron-Secret: <CRON_SECRET>`.
+
+## Ежедневный email-отчёт (Cloud Scheduler + Secret Manager)
+
+Сервис может сам раз в день забирать данные Garmin за текущий день, анализировать их через Gemini и присылать письмо. Авторизация в Garmin — по сохранённому токену (без SSO/паролей в проде), что исключает блокировки 429.
+
+### 1. Токен Garmin в Secret Manager (вместо логина по паролю)
+
+В проде логин по email/паролю упирается в Cloudflare/429. Поэтому используем готовый токен `garth` (живёт обычно ~год).
+
+1. **Локально получите токен** (один раз; нужен удачный локальный вход в Garmin — каталог `.garmin-tokens` уже создаётся при работе локально):
+
+   ```powershell
+   .\.venv\Scripts\python.exe scripts\garmin_token_base64.py
+   ```
+
+   Скрипт напечатает одну длинную строку JSON (начинается с `{`, заканчивается `}`). Скопируйте её целиком.
+
+2. **Создайте секрет** `garmin-tokens-base64` в [Secret Manager](https://console.cloud.google.com/security/secret-manager?project=mybody-dev-env) и вставьте строку целиком (от `{` до `}`).
+
+3. При смене пароля Garmin токен нужно пересоздать этим же скриптом и обновить версию секрета.
+
+### 2. Минимум секретов в GCP (бесплатный tier)
+
+У вас уже есть 4 секрета — **новый в GCP нужен только один**:
+
+| Секрет в GCP | У вас | Назначение |
+|--------------|-------|------------|
+| `garmin-email` | ✓ | Email Garmin **и** адрес отправителя/получателя письма (переиспользуется) |
+| `garmin-password` | ✓ | Пароль Garmin (запасной вход; в проде приоритет у токена) |
+| `garmin-tokens-base64` | ✓ | Токен Garmin (JSON от `{` до `}`) — основной вход в Cloud Run |
+| `gemini-api-key` | ✓ | Ключ Gemini |
+| **`smtp-password`** | **создать** | **App Password** Gmail ([создать](https://myaccount.google.com/apppasswords); это **не** пароль Garmin) |
+
+**Не создавайте** отдельно `smtp-user`, `cron-secret`, `mail-to` — они не нужны:
+
+- **Отправитель и получатель** — тот же адрес из `garmin-email` (переменная `GARMIN_EMAIL` в Cloud Run).
+- **`CRON_SECRET`** — не в Secret Manager, а в **GitHub → Settings → Secrets and variables → Actions → Secrets** → имя `CRON_SECRET`, значение — любая длинная строка. При деплое она попадает в Cloud Run как env-переменная. **То же значение** укажите в заголовке Cloud Scheduler `X-Cron-Secret`.
+
+**Права:** сервисному аккаунту Cloud Run — **Secret Manager Secret Accessor** на перечисленные секреты (включая новый `smtp-password`).
+
+### 3. Cloud Scheduler — запуск в 23:55 (Europe/Dublin)
+
+После деплоя сервиса (URL вида `https://mybody-xxxx.europe-west1.run.app`) создайте задание (подставьте URL и значение `CRON_SECRET` из GitHub):
+
+```bash
+gcloud scheduler jobs create http mybody-daily-report \
+  --project=mybody-dev-env \
+  --location=europe-west1 \
+  --schedule="55 23 * * *" \
+  --time-zone="Europe/Dublin" \
+  --uri="https://YOUR_SERVICE_URL/internal/daily-report" \
+  --http-method=POST \
+  --headers="X-Cron-Secret=ЗНАЧЕНИЕ_CRON_SECRET" \
+  --attempt-deadline=300s
+```
+
+Проверить вручную (без ожидания расписания):
+
+```bash
+gcloud scheduler jobs run mybody-daily-report --location=europe-west1 --project=mybody-dev-env
+```
+
+Или напрямую (например, без отправки письма — только проверить сбор и анализ):
+
+```bash
+curl -X POST "https://YOUR_SERVICE_URL/internal/daily-report?send=false" -H "X-Cron-Secret: ЗНАЧЕНИЕ"
+```
+
+### Переменные окружения email-отчёта
+
+| Переменная | Откуда | Описание |
+|------------|--------|----------|
+| `GARMINTOKENS_BASE64` | Secret Manager | Токен Garmin (JSON) — вход без SSO |
+| `GARMIN_EMAIL` | Secret Manager (`garmin-email`) | Email Garmin; же адрес для SMTP From/To |
+| `SMTP_PASSWORD` | Secret Manager (`smtp-password`) | App Password Gmail |
+| `CRON_SECRET` | GitHub Secret → env при деплое | Заголовок `X-Cron-Secret` для `/internal/*` |
+| `SMTP_HOST` / `SMTP_PORT` | env при деплое | По умолчанию `smtp.gmail.com:587` |
+| `MAIL_TO` / `SMTP_USER` | (опц.) | Если не заданы — используется `GARMIN_EMAIL` |
 
 ### Методы Garmin API (GET /garmin/metrics)
 
