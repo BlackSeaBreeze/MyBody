@@ -33,8 +33,8 @@ def build_detailed_report_md(
     context_meta: dict[str, Any] | None = None,
 ) -> str:
     """
-    Markdown-отчёт для папки Detailed: максимум структуры для последующего
-    повторного анализа Gemini за неделю/месяц.
+    Markdown-отчёт для архива GCS: компактные метаданные + экспертный анализ Gemini
+    (без сырых метрик — только выводы для последующего мета-анализа за неделю/месяц).
     """
     ctx = context_meta or {}
     generated_at = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -42,7 +42,7 @@ def build_detailed_report_md(
 
     frontmatter = {
         "date": day_label,
-        "document_type": "mybody-daily-detailed",
+        "document_type": "mybody-daily-expert-analysis",
         "model": model,
         "generated_at_utc": generated_at,
         "purpose": "long_term_reanalysis",
@@ -65,21 +65,11 @@ def build_detailed_report_md(
         },
     }
 
-    metrics_snapshot = {
-        "from": metrics.get("from"),
-        "to": metrics.get("to"),
-        "activities": metrics.get("activities") or [],
-        "metrics_by_day": metrics.get("metrics_by_day") or {},
-        "range_metrics": metrics.get("range_metrics") or {},
-        "global_metrics": metrics.get("global_metrics") or {},
-    }
-
     meta_json = json.dumps(frontmatter, ensure_ascii=False, indent=2)
-    snap_json = json.dumps(metrics_snapshot, ensure_ascii=False, indent=2, default=str)
 
-    return f"""# Подробный дневной отчёт MyBody — {day_label}
+    return f"""# Экспертный дневной анализ MyBody — {day_label}
 
-> Архив для мета-анализа (неделя / месяц). Не удаляйте секции при объединении файлов.
+> Архив для мета-анализа (неделя / месяц). Только выводы эксперта, без сырых данных Garmin.
 
 ## Метаданные (JSON)
 
@@ -87,15 +77,7 @@ def build_detailed_report_md(
 {meta_json}
 ```
 
-## Анализ Gemini (архивный, максимальная детализация)
+## Анализ
 
 {detailed_analysis.strip()}
-
----
-
-## Снимок сырых метрик Garmin (JSON)
-
-```json
-{snap_json}
-```
 """
