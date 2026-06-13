@@ -532,7 +532,9 @@ def daily_report(
     x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
 ):
     """
-    Ежедневный отчёт за один календарный день (по умолчанию сегодня в REPORT_TIMEZONE; сон = прошедшая ночь).
+    Ежедневный отчёт за один календарный день.
+    По умолчанию: до 12:00 (REPORT_DAY_CUTOFF_HOUR) в REPORT_TIMEZONE — вчера,
+    иначе сегодня (cron в 23:45). Явно: ?day=YYYY-MM-DD.
 
     Порядок:
     1) Garmin → один Gemini-вызов → archive/vb-….md (сырые метрики остаются в памяти)

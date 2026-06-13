@@ -205,7 +205,9 @@ API: <http://localhost:8000>
 
 **Права:** сервисному аккаунту Cloud Run — **Secret Manager Secret Accessor** на перечисленные секреты (включая новый `smtp-password`).
 
-### 3. Cloud Scheduler — запуск в 23:55 (Europe/Dublin)
+### 3. Cloud Scheduler — запуск в 23:45 (Europe/Dublin)
+
+Запуск **за 15 минут до полуночи**, чтобы при retry/fallback Gemini (паузы между вызовами, смена модели) отчёт успел завершиться до 00:00 и остался привязан к текущему календарному дню.
 
 После деплоя сервиса (URL вида `https://mybody-xxxx.europe-west1.run.app`) создайте задание (подставьте URL и значение `CRON_SECRET` из GitHub):
 
@@ -213,7 +215,7 @@ API: <http://localhost:8000>
 gcloud scheduler jobs create http mybody-daily-report \
   --project=mybody-dev-env \
   --location=europe-west1 \
-  --schedule="55 23 * * *" \
+  --schedule="45 23 * * *" \
   --time-zone="Europe/Dublin" \
   --uri="https://YOUR_SERVICE_URL/internal/daily-report" \
   --http-method=POST \
@@ -251,8 +253,8 @@ curl -X POST "https://YOUR_SERVICE_URL/internal/daily-report?send=false" -H "X-C
 
 | Папка | ID | Файл | Содержимое |
 |-------|-----|------|------------|
-| **Shorts** | `1HRSJLA3oU8zF3a0xivRl21yTr5I9cemy` | `vb-20260613-2355.html` | HTML как в письме (таблица + краткий анализ) |
-| **Detailed** | `1cLtfTCYhGxHeYWBHXl19ZUG_2YzixNYt` | `vb-20260613-2355.md` | Подробный архивный анализ Gemini + JSON метрик |
+| **Shorts** | `1HRSJLA3oU8zF3a0xivRl21yTr5I9cemy` | `vb-20260613-2345.html` | HTML как в письме (таблица + краткий анализ) |
+| **Detailed** | `1cLtfTCYhGxHeYWBHXl19ZUG_2YzixNYt` | `vb-20260613-2345.md` | Подробный архивный анализ Gemini + JSON метрик |
 
 **Настройка (без новых секретов в GCP):**
 

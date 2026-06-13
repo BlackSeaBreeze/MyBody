@@ -377,22 +377,50 @@ def fetch_all_metrics(days: int = 7) -> dict[str, Any]:
         return {"ok": False, "error": str(e), "metrics_by_day": None}
 
 
-def _report_calendar_day() -> Any:
-    """Календарный «сегодня» в REPORT_TIMEZONE (как file_stem и папки Meals)."""
+def _report_timezone() -> ZoneInfo:
     tz_name = os.environ.get("REPORT_TIMEZONE", "Europe/Dublin").strip() or "Europe/Dublin"
     try:
-        tz = ZoneInfo(tz_name)
+        return ZoneInfo(tz_name)
     except Exception:
-        tz = ZoneInfo("Europe/Dublin")
-    return datetime.now(tz).date()
+        return ZoneInfo("Europe/Dublin")
+
+
+def _report_calendar_day() -> Any:
+    """Календарный «сегодня» в REPORT_TIMEZONE (как file_stem и папки Meals)."""
+    return datetime.now(_report_timezone()).date()
+
+
+def _default_report_day() -> Any:
+    """
+    День отчёта по умолчанию (когда day= не передан).
+    До REPORT_DAY_CUTOFF_HOUR — вчера (ручной запуск после полуночи).
+    После cutoff — сегодня (cron в 23:45).
+    REPORT_DAY_OFFSET (например -1) переопределяет сдвиг от «сегодня».
+    """
+    today = _report_calendar_day()
+    env_offset = os.environ.get("REPORT_DAY_OFFSET", "").strip()
+    if env_offset:
+        try:
+            return today + timedelta(days=int(env_offset))
+        except ValueError:
+            pass
+
+    now = datetime.now(_report_timezone())
+    try:
+        cutoff = int(os.environ.get("REPORT_DAY_CUTOFF_HOUR", "12"))
+    except ValueError:
+        cutoff = 12
+    cutoff = max(0, min(23, cutoff))
+    if now.hour < cutoff:
+        return today - timedelta(days=1)
+    return today
 
 
 def fetch_daily_metrics(day: str | None = None) -> dict[str, Any]:
     """
-    Загружает все метрики за один календарный день (по умолчанию — сегодня).
-    Сон Garmin привязан к дате пробуждения, поэтому данные сна за сегодня — это
-    прошедшая ночь (сон, завершившийся сегодня утром). Подходит для ежедневного
-    отчёта в конце дня (например, 23:55).
+    Загружает все метрики за один календарный день.
+    По умолчанию — _default_report_day() (до полудня вчера, иначе сегодня; см. REPORT_DAY_CUTOFF_HOUR).
+    Сон Garmin привязан к дате пробуждения: для «сегодня» в 23:45 это прошедшая ночь.
     """
     api, client_err, client_detail = get_client()
     if api is None:
@@ -401,7 +429,7 @@ def fetch_daily_metrics(day: str | None = None) -> dict[str, Any]:
         if day:
             target = datetime.fromisoformat(day).date()
         else:
-            target = _report_calendar_day()
+            target = _default_report_day()
         return _collect_metrics_range(api, target, target)
     except Exception as e:
         return {"ok": False, "error": str(e), "metrics_by_day": None}
