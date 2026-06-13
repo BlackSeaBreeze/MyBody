@@ -160,7 +160,7 @@ API: <http://localhost:8000>
 - **GET /garmin/metrics?days=7** — **все доступные метрики** за период (stats, sleep, heart_rates, stress, body_battery, hydration, respiration, SpO2, HRV, training_readiness и др.) в виде `metrics_by_day[date]` — готовый контекст для Gemini.
 - **GET /garmin/summary?days=7** — удобочитаемая сводка по дням (JSON).
 - **GET /garmin/view?days=7** — страница с таблицей по дням.
-- **GET /garmin/analyze?days=7** — анализ данных Garmin через **Gemini**: загружаются метрики за период, отправляются в модель, возвращается текст с выводами и рекомендациями. Параметр `model` (по умолчанию **gemini-3-flash-preview**), опционально `days` (1–31). Требуется **GEMINI_API_KEY** (см. раздел Gemini ниже).
+- **GET /garmin/analyze?days=7** — анализ данных Garmin через **Gemini** (по умолчанию `gemini-2.5-flash`, можно `model=` или env `GEMINI_MODEL`).
 - **POST /internal/garmin-fetch?days=1** — то же для вызова по расписанию. Если задан **CRON_SECRET**, в запросе обязателен заголовок **`X-Cron-Secret`** с тем же значением.
 - **POST /internal/daily-report** — ежедневный отчёт: метрики Garmin за один день (по умолчанию сегодня; сон = прошедшая ночь), анализ через Gemini и **отправка письма** (таблица показателей + анализ) на `MAIL_TO`. Защищён `X-Cron-Secret`. Параметры: `day=YYYY-MM-DD` (необязательно), `model`, `send=false` (сформировать без отправки).
 
@@ -243,6 +243,35 @@ curl -X POST "https://YOUR_SERVICE_URL/internal/daily-report?send=false" -H "X-C
 | `CRON_SECRET` | GitHub Secret → env при деплое | Заголовок `X-Cron-Secret` для `/internal/*` |
 | `SMTP_HOST` / `SMTP_PORT` | env при деплое | По умолчанию `smtp.gmail.com:587` |
 | `MAIL_TO` / `SMTP_USER` | (опц.) | Если не заданы — используется `GARMIN_EMAIL` |
+| `GEMINI_INTER_CALL_DELAY_SEC` | env при деплое (65) | Пауза между кратким и подробным вызовом Gemini (сек), чтобы не упираться в TPM/мин |
+
+### Google Drive — сохранение отчётов
+
+При каждом `/internal/daily-report` (по умолчанию `save_drive=true`) создаются два файла с именем **`vb-YYYYMMDD-hhmm`** (24ч, часовой пояс `REPORT_TIMEZONE`, по умолчанию Europe/Dublin):
+
+| Папка | ID | Файл | Содержимое |
+|-------|-----|------|------------|
+| **Shorts** | `1HRSJLA3oU8zF3a0xivRl21yTr5I9cemy` | `vb-20260613-2355.html` | HTML как в письме (таблица + краткий анализ) |
+| **Detailed** | `1cLtfTCYhGxHeYWBHXl19ZUG_2YzixNYt` | `vb-20260613-2355.md` | Подробный архивный анализ Gemini + JSON метрик |
+
+**Настройка (без новых секретов в GCP):**
+
+1. Включите [Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com?project=mybody-dev-env) в проекте.
+2. Узнайте email сервисного аккаунта Cloud Run: `401681859743-compute@developer.gserviceaccount.com`.
+3. Расшарьте обе папки ([Shorts](https://drive.google.com/drive/folders/1HRSJLA3oU8zF3a0xivRl21yTr5I9cemy), [Detailed](https://drive.google.com/drive/folders/1cLtfTCYhGxHeYWBHXl19ZUG_2YzixNYt)) → **Share** → email SA с ролью **Editor**.
+4. ID папок и `REPORT_TIMEZONE` прописаны в [deploy.yml](.github/workflows/deploy.yml).
+5. Redeploy после push.
+
+**Локально:** те же env-переменные + `gcloud auth application-default login` или JSON сервисного аккаунта в `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON`.
+
+Проверка без письма, только Drive:
+
+```bash
+curl -X POST "https://YOUR_SERVICE_URL/internal/daily-report?send=false" \
+  -H "X-Cron-Secret: ..." --data-raw "{}"
+```
+
+В ответе: `drive_shorts.ok`, `drive_detailed.ok`, `webViewLink`.
 
 ### Методы Garmin API (GET /garmin/metrics)
 
@@ -314,7 +343,7 @@ curl -X POST "https://YOUR_SERVICE_URL/internal/daily-report?send=false" -H "X-C
 
 Для эндпоинта **GET /garmin/analyze** используется Google Gemini: данные Garmin за выбранный период отправляются в модель, которая возвращает краткий анализ и рекомендации (сон, активность, стресс, восстановление).
 
-По умолчанию используется модель **gemini-3-flash-preview** (семейство Gemini 3). Для максимальной глубины анализа можно передать `model=gemini-3.1-pro-preview`. Список моделей: `https://generativelanguage.googleapis.com/v1beta/models?key=ВАШ_API_KEY`. Для платных моделей нужен включённый биллинг в [Google AI Studio](https://aistudio.google.com).
+По умолчанию **gemini-2.5-flash** (стабильная GA-модель). Переопределение: env `GEMINI_MODEL` в Cloud Run или параметр `?model=` в запросе. Для максимальной глубины архивного анализа можно `GEMINI_MODEL=gemini-2.5-pro`. Список моделей: [Google AI models](https://ai.google.dev/gemini-api/docs/models).
 
 ### Где хранить API-ключ
 

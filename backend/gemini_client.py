@@ -218,22 +218,89 @@ SYSTEM_PROMPT = """Ты — персональный помощник по зд�
 Формат ответа: на русском языке, структурированно (короткие абзацы или списки), без лишнего вступления. Не придумывай данные — опирайся только на переданные метрики; формулируй причинно-следственные связи как обоснованные гипотезы, а не как факты."""
 
 
-def analyze_garmin_metrics(metrics: dict[str, Any], model: str = "gemini-2.5-flash") -> dict[str, Any]:
-    """
-    Отправляет данные Garmin в Gemini и возвращает анализ и рекомендации.
+SYSTEM_PROMPT_DETAILED = """Ты — медицинско-спортивный аналитик данных Garmin. Тебе передают сырые данные за ОДИН день.
+Твой ответ будет сохранён в архив для последующего повторного анализа за неделю или месяц другой моделью Gemini.
+Пиши МАКСИМАЛЬНО ПОДРОБНО: каждая значимая цифра, интервал времени, пик, провал, корреляция.
 
-    :param metrics: результат garmin_client.fetch_all_metrics(days=...)
-    :param model: имя модели. По умолчанию gemini-2.5-flash (GA, стабильная).
-                  Варианты: gemini-3-flash-preview / gemini-3.1-pro-preview (новее, но preview
-                  бывает перегружен — 503), gemini-2.0-flash.
-    :return: {"ok": True, "analysis": "текст от модели"} или {"ok": False, "error": "..."}
-    """
+ОБЯЗАТЕЛЬНАЯ СТРУКТУРА (Markdown, все секции заполни; если данных нет — явно укажи «нет данных»):
+
+## meta
+- date: YYYY-MM-DD
+- data_completeness: оценка полноты данных (high/medium/low) и что отсутствует
+
+## sleep
+- Время отхода ко сну, пробуждения, общая длительность (ч/мин)
+- Фазы: deep / light / REM / awake (длительность и %)
+- Sleep score / qualifier если есть
+- ЧСС и дыхание во сне (min/max/avg если есть)
+- SpO2 ночью (min/avg, эпизоды если есть)
+- Связь с восстановлением (Body Battery при пробуждении, HRV утром)
+
+## stress_and_hrv
+- Средний стресс, пики (значение + примерное время суток если видно из рядов)
+- Длительность высокого стресса (>75 или >90)
+- HRV: статус, avg, min, max, тренд vs baseline если есть
+- Гипотезы физиологических причин стресса (не эмоций!) с опорой на цифры соседних метрик
+
+## body_battery_and_recovery
+- Уровень при пробуждении и в конце дня
+- Значимые спады/подъёмы и возможные триггеры (активность, стресс, время)
+- Training readiness / training status если есть
+
+## activity_and_load
+- Шаги, цель, расстояние, калории (total/active)
+- Минуты интенсивности, floors
+- Каждая тренировка: тип, время начала, длительность, дистанция, avg/max HR, калории, эффект на Body Battery
+- Был ли день перегрузки или недогрузки
+
+## cardiovascular
+- Пульс покоя (RHR), max HR за день
+- Аномалии пульса (если видны в рядах)
+
+## respiration_spo2_hydration
+- Дыхание (avg/min/max), SpO2, гидратация — всё что есть в данных
+
+## correlations_and_timeline
+- Хронология ключевых событий дня (сон → утро → активность → вечер) с цифрами
+- Минимум 3–5 конкретных корреляций («когда X было N, через T часов Y стало M»)
+- Выбросы и аномалии
+
+## problems_and_risks
+- Все проблемные показатели с severity (low/medium/high) и evidence (цифры)
+
+## hypotheses
+- Обоснованные гипотезы о причинах отклонений (не выдумывай факты вне данных)
+
+## data_gaps
+- Чего не хватает для точного вывода (еда, алкоголь, кофеин, самочувствие, и т.д.)
+
+## facts_for_aggregation
+Список атомарных фактов для машинного сведения — каждый пункт одной строкой:
+- FACT | category=... | metric=... | value=... | time=... | note=...
+
+Правила:
+- Язык: русский.
+- Не сокращай: лучше длинный отчёт, чем потеря деталей.
+- Все числа из данных — сохраняй как в источнике.
+- Не придумывай метрики, которых нет во входе.
+- Стресс Garmin = HRV-метрика, не психология."""
+
+
+def _call_gemini(
+    *,
+    metrics: dict[str, Any],
+    model: str,
+    system_instruction: str,
+    user_intro: str,
+    temperature: float = 0.4,
+    max_output_tokens: int | None = None,
+    max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
+) -> dict[str, Any]:
     if genai is None or types is None:
         return {"ok": False, "error": "gemini_sdk_not_installed", "analysis": None}
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         return {"ok": False, "error": "gemini_not_configured", "analysis": None}
-
     if not metrics.get("ok"):
         return {
             "ok": False,
@@ -241,25 +308,71 @@ def analyze_garmin_metrics(metrics: dict[str, Any], model: str = "gemini-2.5-fla
             "analysis": None,
         }
 
-    text_context, meta = build_prompt_context(metrics)
-    user_content = (
-        "Ниже данные из Garmin Connect за указанный период. "
-        "Проанализируй их и дай краткий отчёт с рекомендациями.\n\n"
-        + text_context
-    )
+    text_context, meta = build_prompt_context(metrics, max_input_tokens=max_input_tokens)
+    user_content = user_intro + "\n\n" + text_context
+    cfg_kwargs: dict[str, Any] = {
+        "system_instruction": system_instruction,
+        "temperature": temperature,
+    }
+    if max_output_tokens is not None:
+        cfg_kwargs["max_output_tokens"] = max_output_tokens
 
     try:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
             model=model,
             contents=user_content,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.4,
-            ),
+            config=types.GenerateContentConfig(**cfg_kwargs),
         )
         if not response or not getattr(response, "text", None):
             return {"ok": False, "error": "empty_gemini_response", "analysis": None, "context": meta}
         return {"ok": True, "analysis": response.text.strip(), "model": model, "context": meta}
     except Exception as e:
         return {"ok": False, "error": str(e), "analysis": None, "context": meta}
+
+
+DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+
+
+def analyze_garmin_metrics(metrics: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    """
+    Отправляет данные Garmin в Gemini и возвращает анализ и рекомендации.
+
+    :param metrics: результат garmin_client.fetch_all_metrics(days=...)
+    :param model: имя модели. По умолчанию GEMINI_MODEL env или gemini-2.5-flash.
+    :return: {"ok": True, "analysis": "текст от модели"} или {"ok": False, "error": "..."}
+    """
+    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    return _call_gemini(
+        metrics=metrics,
+        model=model,
+        system_instruction=SYSTEM_PROMPT,
+        user_intro=(
+            "Ниже данные из Garmin Connect за указанный период. "
+            "Проанализируй их и дай краткий отчёт с рекомендациями."
+        ),
+        temperature=0.4,
+    )
+
+
+def analyze_garmin_metrics_detailed(
+    metrics: dict[str, Any],
+    model: str | None = None,
+) -> dict[str, Any]:
+    """
+    Подробный архивный анализ за день для сохранения в Drive (Detailed).
+    Максимум деталей для последующего мета-анализа за неделю/месяц.
+    """
+    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    return _call_gemini(
+        metrics=metrics,
+        model=model,
+        system_instruction=SYSTEM_PROMPT_DETAILED,
+        user_intro=(
+            "Ниже сырые данные Garmin Connect за один день. "
+            "Сформируй архивный подробный отчёт по обязательной структуре из инструкции. "
+            "Этот текст позже будет объединён с другими днями для анализа трендов."
+        ),
+        temperature=0.25,
+        max_output_tokens=8192,
+    )

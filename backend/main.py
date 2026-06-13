@@ -5,6 +5,7 @@ MyBody — бэкенд: ежедневные рекомендации и чат
 import html
 import os
 import re
+import time
 
 from dotenv import load_dotenv
 
@@ -14,7 +15,18 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from backend import email_client, garmin_client, gemini_client
+from backend import drive_client, email_client, garmin_client, gemini_client
+from backend import report_formats
+from backend.gemini_client import DEFAULT_GEMINI_MODEL
+
+
+def _gemini_inter_call_delay_sec() -> int:
+    """Пауза между двумя вызовами Gemini (TPM сбрасывается поминутно на Free tier)."""
+    try:
+        return max(0, int(os.environ.get("GEMINI_INTER_CALL_DELAY_SEC", "65")))
+    except ValueError:
+        return 65
+
 
 app = FastAPI(
     title="MyBody API",
@@ -180,7 +192,7 @@ def _garmin_view_html(
 def garmin_analyze(
     request: Request,
     days: int = 7,
-    model: str = "gemini-2.5-flash",
+    model: str | None = None,
     format: str | None = None,
 ):
     """
@@ -192,6 +204,7 @@ def garmin_analyze(
     клиентам (Accept: application/json) — JSON. Принудительно: ?format=html|json.
     """
     days = min(max(1, days), 31)
+    model = (model or DEFAULT_GEMINI_MODEL).strip()
     metrics = garmin_client.fetch_all_metrics(days=days)
     result = gemini_client.analyze_garmin_metrics(metrics, model=model)
 
@@ -378,25 +391,29 @@ def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, m
 @app.post("/internal/daily-report")
 def daily_report(
     day: str | None = None,
-    model: str = "gemini-2.5-flash",
+    model: str | None = None,
     send: bool = True,
+    save_drive: bool = True,
     x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
 ):
     """
     Ежедневный отчёт: метрики Garmin за один день (по умолчанию сегодня; сон = прошедшая ночь),
-    анализ через Gemini и отправка письма (таблица + анализ) на MAIL_TO.
+    краткий анализ Gemini, подробный архивный анализ, письмо на MAIL_TO и сохранение на Google Drive.
+
+    Drive Shorts: HTML (как в письме). Drive Detailed: Markdown с подробным анализом + JSON метрик.
 
     Вызов защищён: при заданном CRON_SECRET требуется заголовок X-Cron-Secret.
-    Для расписания используйте Cloud Scheduler (POST, заголовок X-Cron-Secret).
-    Параметры: day=YYYY-MM-DD (необязательно), model, send=false (только сформировать, без отправки).
+    Параметры: day, model, send=false, save_drive=false.
     """
     secret = os.environ.get("CRON_SECRET", "").strip()
     if secret and x_cron_secret != secret:
         raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
 
     metrics = garmin_client.fetch_daily_metrics(day=day)
-    day_label = metrics.get("to") or day or "сегодня"
-    result: dict = {"ok": bool(metrics.get("ok")), "day": day_label}
+    day_label = str(metrics.get("to") or day or "сегодня")
+    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    file_stem = report_formats.drive_file_stem()
+    result: dict = {"ok": bool(metrics.get("ok")), "day": day_label, "file_stem": file_stem, "model": model}
 
     if not metrics.get("ok"):
         result["error"] = metrics.get("error")
@@ -412,24 +429,61 @@ def daily_report(
     if not analysis.get("ok"):
         result["analysis_error"] = analysis.get("error")
 
+    html_body = _daily_email_html(
+        day_label=day_label, analysis_result=analysis, summary=summary, model=model
+    )
+
     if send:
         if not email_client.is_configured():
             result["emailed"] = False
             result["email_error"] = "smtp_not_configured"
-            return JSONResponse(result, status_code=500)
-        html_body = _daily_email_html(
-            day_label=str(day_label), analysis_result=analysis, summary=summary, model=model
-        )
-        subject = f"MyBody — отчёт Garmin за {day_label}"
-        text_alt = analysis.get("analysis") or "Отчёт MyBody (откройте в HTML-клиенте)."
-        sent = email_client.send_email(subject, html_body, text_body=text_alt)
-        result["emailed"] = bool(sent.get("ok"))
-        if sent.get("ok"):
-            result["recipients"] = sent.get("to")
         else:
-            result["email_error"] = sent.get("error")
-            result["email_detail"] = sent.get("detail")
-            return JSONResponse(result, status_code=502)
+            subject = f"MyBody — отчёт Garmin за {day_label}"
+            text_alt = analysis.get("analysis") or "Отчёт MyBody (откройте в HTML-клиенте)."
+            sent = email_client.send_email(subject, html_body, text_body=text_alt)
+            result["emailed"] = bool(sent.get("ok"))
+            if sent.get("ok"):
+                result["recipients"] = sent.get("to")
+            else:
+                result["email_error"] = sent.get("error")
+                result["email_detail"] = sent.get("detail")
+
+    if save_drive and drive_client.is_configured():
+        short_name = f"{file_stem}.html"
+        short_up = drive_client.upload_to_shorts(short_name, html_body)
+        result["drive_shorts"] = short_up
+
+        delay = _gemini_inter_call_delay_sec()
+        if delay > 0:
+            time.sleep(delay)
+        result["gemini_inter_call_delay_sec"] = delay
+
+        detailed = gemini_client.analyze_garmin_metrics_detailed(metrics, model=model)
+        result["detailed_analysis_ok"] = bool(detailed.get("ok"))
+        if detailed.get("ok"):
+            detailed_md = report_formats.build_detailed_report_md(
+                day_label=day_label,
+                detailed_analysis=detailed["analysis"],
+                metrics=metrics,
+                summary=summary,
+                model=model,
+                context_meta=detailed.get("context"),
+            )
+            detailed_name = f"{file_stem}.md"
+            detailed_up = drive_client.upload_to_detailed(detailed_name, detailed_md)
+            result["drive_detailed"] = detailed_up
+        else:
+            result["detailed_analysis_error"] = detailed.get("error")
+            result["drive_detailed"] = {"ok": False, "error": "detailed_analysis_failed"}
+    elif save_drive:
+        result["drive_skipped"] = "drive_not_configured"
+
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=502)
+    if send and result.get("email_error") and not result.get("emailed"):
+        return JSONResponse(result, status_code=502)
+    if save_drive and result.get("drive_shorts", {}).get("ok") is False:
+        return JSONResponse(result, status_code=502)
 
     return JSONResponse(result)
 
