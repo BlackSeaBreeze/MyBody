@@ -19,17 +19,24 @@ import os
 from typing import Any
 
 try:
+    import httplib2
     import google.auth
     from google.oauth2 import service_account
+    from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaInMemoryUpload
 except ImportError:
+    httplib2 = None  # type: ignore
     google = None  # type: ignore
+    AuthorizedHttp = None  # type: ignore
     service_account = None  # type: ignore
     build = None  # type: ignore
+    HttpError = None  # type: ignore
     MediaInMemoryUpload = None  # type: ignore
 
 _DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive",)
+_DRIVE_HTTP_TIMEOUT_SEC = 120
 
 
 def is_configured() -> bool:
@@ -52,7 +59,10 @@ def _credentials():
 
 
 def _service():
-    return build("drive", "v3", credentials=_credentials(), cache_discovery=False)
+    creds = _credentials()
+    http = httplib2.Http(timeout=_DRIVE_HTTP_TIMEOUT_SEC)
+    authorized = AuthorizedHttp(creds, http=http)
+    return build("drive", "v3", http=authorized, cache_discovery=False)
 
 
 def _find_file_id(service, folder_id: str, name: str) -> str | None:
@@ -105,8 +115,24 @@ def upload_text(
             "webViewLink": created.get("webViewLink"),
             "updated": False,
         }
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        return {
+            "ok": False,
+            "error": "drive_upload_failed",
+            "detail": str(e),
+            "http_status": status,
+            "folder_id": folder_id,
+            "filename": filename,
+        }
     except Exception as e:
-        return {"ok": False, "error": "drive_upload_failed", "detail": str(e)}
+        return {
+            "ok": False,
+            "error": "drive_upload_failed",
+            "detail": str(e),
+            "folder_id": folder_id,
+            "filename": filename,
+        }
 
 
 def upload_to_shorts(filename: str, content: str, mime_type: str = "text/html; charset=utf-8") -> dict[str, Any]:

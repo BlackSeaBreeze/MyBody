@@ -3,6 +3,7 @@ MyBody — бэкенд: ежедневные рекомендации и чат
 Данные из приложения (фото еды, витамины, активность, Garmin) — один контекст для отчёта и чата.
 """
 import html
+import logging
 import os
 import re
 import time
@@ -18,6 +19,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from backend import drive_client, email_client, garmin_client, gemini_client
 from backend import report_formats
 from backend.gemini_client import DEFAULT_GEMINI_MODEL
+
+logger = logging.getLogger(__name__)
 
 
 def _gemini_inter_call_delay_sec() -> int:
@@ -433,25 +436,14 @@ def daily_report(
         day_label=day_label, analysis_result=analysis, summary=summary, model=model
     )
 
-    if send:
-        if not email_client.is_configured():
-            result["emailed"] = False
-            result["email_error"] = "smtp_not_configured"
-        else:
-            subject = f"MyBody — отчёт Garmin за {day_label}"
-            text_alt = analysis.get("analysis") or "Отчёт MyBody (откройте в HTML-клиенте)."
-            sent = email_client.send_email(subject, html_body, text_body=text_alt)
-            result["emailed"] = bool(sent.get("ok"))
-            if sent.get("ok"):
-                result["recipients"] = sent.get("to")
-            else:
-                result["email_error"] = sent.get("error")
-                result["email_detail"] = sent.get("detail")
-
     if save_drive and drive_client.is_configured():
         short_name = f"{file_stem}.html"
         short_up = drive_client.upload_to_shorts(short_name, html_body)
         result["drive_shorts"] = short_up
+        if short_up.get("ok"):
+            logger.info("Drive Shorts saved: %s", short_name)
+        else:
+            logger.error("Drive Shorts failed: %s", short_up)
 
         delay = _gemini_inter_call_delay_sec()
         if delay > 0:
@@ -472,11 +464,32 @@ def daily_report(
             detailed_name = f"{file_stem}.md"
             detailed_up = drive_client.upload_to_detailed(detailed_name, detailed_md)
             result["drive_detailed"] = detailed_up
+            if detailed_up.get("ok"):
+                logger.info("Drive Detailed saved: %s", detailed_name)
+            else:
+                logger.error("Drive Detailed failed: %s", detailed_up)
         else:
             result["detailed_analysis_error"] = detailed.get("error")
             result["drive_detailed"] = {"ok": False, "error": "detailed_analysis_failed"}
+            logger.error("Detailed Gemini analysis failed: %s", detailed.get("error"))
     elif save_drive:
         result["drive_skipped"] = "drive_not_configured"
+        logger.warning("Drive save skipped: folders not configured")
+
+    if send:
+        if not email_client.is_configured():
+            result["emailed"] = False
+            result["email_error"] = "smtp_not_configured"
+        else:
+            subject = f"MyBody — отчёт Garmin за {day_label}"
+            text_alt = analysis.get("analysis") or "Отчёт MyBody (откройте в HTML-клиенте)."
+            sent = email_client.send_email(subject, html_body, text_body=text_alt)
+            result["emailed"] = bool(sent.get("ok"))
+            if sent.get("ok"):
+                result["recipients"] = sent.get("to")
+            else:
+                result["email_error"] = sent.get("error")
+                result["email_detail"] = sent.get("detail")
 
     if not result.get("ok"):
         return JSONResponse(result, status_code=502)
