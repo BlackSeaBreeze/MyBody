@@ -81,3 +81,45 @@ def build_detailed_report_md(
 
 {detailed_analysis.strip()}
 """
+
+
+def build_food_report_md(
+    *,
+    day_label: str,
+    food_analysis: str,
+    model: str,
+    photo_meta: dict[str, Any] | None = None,
+    context_meta: dict[str, Any] | None = None,
+) -> str:
+    """Markdown-отчёт по питанию для GCS archive/vb-…-food.md."""
+    ctx = context_meta or {}
+    pm = photo_meta or {}
+    generated_at = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    frontmatter = {
+        "date": day_label,
+        "document_type": "mybody-daily-food-analysis",
+        "model": model,
+        "generated_at_utc": generated_at,
+        "purpose": "nutrition_tracking_and_reanalysis",
+        "photos_analyzed": ctx.get("photo_count") or pm.get("photo_count"),
+        "drive_folder": pm.get("folder_name"),
+        "photo_names": [p.get("name") for p in (pm.get("photos") or []) if p.get("name")],
+    }
+
+    meta_json = json.dumps(frontmatter, ensure_ascii=False, indent=2)
+
+    return f"""# Анализ питания MyBody — {day_label}
+
+> Архив нутриентов и экспертных выводов по фото еды. Без сырых изображений.
+
+## Метаданные (JSON)
+
+```json
+{meta_json}
+```
+
+## Анализ
+
+{food_analysis.strip()}
+"""

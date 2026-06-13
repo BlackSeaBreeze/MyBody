@@ -391,6 +391,82 @@ def _daily_email_html(*, day_label: str, analysis_result: dict, summary: dict, m
 </html>"""
 
 
+def _profile_hint_from_metrics(metrics: dict) -> str | None:
+    """Краткий профиль из Garmin для уточнения норм питания."""
+    profile = (metrics.get("global_metrics") or {}).get("user_profile")
+    if not isinstance(profile, dict):
+        return None
+    parts: list[str] = []
+    for key in ("gender", "weight", "height", "birthDate", "activityLevel"):
+        val = profile.get(key)
+        if val is not None:
+            parts.append(f"{key}={val}")
+    return "; ".join(parts) if parts else None
+
+
+def _save_food_analysis(
+    *,
+    day_label: str,
+    file_stem: str,
+    model: str,
+    metrics: dict,
+    result: dict,
+) -> None:
+    """Загружает фото еды из Drive, анализирует Gemini, сохраняет в GCS archive."""
+    if not drive_client.is_meals_configured():
+        result["meals_skipped"] = "drive_meals_not_configured"
+        return
+
+    meals = drive_client.fetch_day_meal_photos(day_label)
+    result["meals_fetch"] = {
+        "ok": meals.get("ok"),
+        "folder_name": meals.get("folder_name"),
+        "folder_found": meals.get("folder_found"),
+        "photo_count": meals.get("photo_count", 0),
+        "error": meals.get("error"),
+    }
+    if not meals.get("ok"):
+        logger.error("Meals fetch failed: %s", meals.get("error"))
+        return
+    if not meals.get("folder_found"):
+        result["food_analysis_skipped"] = "day_folder_not_found"
+        return
+    if not meals.get("photos"):
+        result["food_analysis_skipped"] = "no_photos"
+        return
+
+    delay = _gemini_inter_call_delay_sec()
+    if delay > 0:
+        time.sleep(delay)
+
+    food = gemini_client.analyze_food_photos(
+        meals["photos"],
+        day_label=day_label,
+        model=model,
+        profile_hint=_profile_hint_from_metrics(metrics),
+    )
+    result["food_analysis_ok"] = bool(food.get("ok"))
+    if not food.get("ok"):
+        result["food_analysis_error"] = food.get("error")
+        logger.error("Food Gemini analysis failed: %s", food.get("error"))
+        return
+
+    food_md = report_formats.build_food_report_md(
+        day_label=day_label,
+        food_analysis=food["analysis"],
+        model=model,
+        photo_meta=meals,
+        context_meta=food.get("context"),
+    )
+    food_name = f"{file_stem}-food.md"
+    food_up = storage_client.upload_to_archive(food_name, food_md)
+    result["storage_archive_food"] = food_up
+    if food_up.get("ok"):
+        logger.info("GCS archive food saved: %s", food_up.get("gs_uri"))
+    else:
+        logger.error("GCS archive food failed: %s", food_up)
+
+
 @app.post("/internal/daily-report")
 def daily_report(
     day: str | None = None,
@@ -405,7 +481,7 @@ def daily_report(
     краткий анализ Gemini, подробный архивный анализ, письмо на MAIL_TO и сохранение в GCS.
 
     GCS Shorts: HTML (как в письме) → gs://…/outcomes/vb-….html
-    GCS Archive: Markdown → gs://…/archive/vb-….md
+    GCS Archive: Markdown → gs://…/archive/vb-….md и vb-…-food.md (анализ фото еды из Drive Meals)
 
     Вызов защищён: при заданном CRON_SECRET требуется заголовок X-Cron-Secret.
     Параметры: day, model, send=false, save_reports=false. save_drive — устаревший alias для save_reports.
@@ -477,6 +553,14 @@ def daily_report(
             result["detailed_analysis_error"] = detailed.get("error")
             result["storage_archive"] = {"ok": False, "error": "detailed_analysis_failed"}
             logger.error("Detailed Gemini analysis failed: %s", detailed.get("error"))
+
+        _save_food_analysis(
+            day_label=day_label,
+            file_stem=file_stem,
+            model=model,
+            metrics=metrics,
+            result=result,
+        )
     elif save_reports:
         result["storage_skipped"] = "gcs_not_configured"
         logger.warning("GCS save skipped: GCS_REPORTS_BUCKET not set")
@@ -514,6 +598,21 @@ def storage_probe(x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"
         raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
 
     result = storage_client.probe_access()
+    status = 200 if result.get("ok") else 502
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/internal/meals-probe")
+def meals_probe(
+    day: str | None = None,
+    x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
+):
+    """Диагностика чтения папки Meals на Google Drive (опционально — подпапка за day=YYYY-MM-DD)."""
+    secret = os.environ.get("CRON_SECRET", "").strip()
+    if secret and x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
+
+    result = drive_client.probe_meals_access(day=day)
     status = 200 if result.get("ok") else 502
     return JSONResponse(result, status_code=status)
 

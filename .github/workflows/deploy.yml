@@ -62,7 +62,7 @@ jobs:
             --platform managed \
             --allow-unauthenticated \
             --timeout=540 \
-            --set-env-vars=CRON_SECRET=${{ secrets.CRON_SECRET }},SMTP_HOST=smtp.gmail.com,SMTP_PORT=587,REPORT_TIMEZONE=Europe/Dublin,GEMINI_INTER_CALL_DELAY_SEC=65,GCS_REPORTS_BUCKET=mybody-dev-env-reports \
+            --set-env-vars=CRON_SECRET=${{ secrets.CRON_SECRET }},SMTP_HOST=smtp.gmail.com,SMTP_PORT=587,REPORT_TIMEZONE=Europe/Dublin,GEMINI_INTER_CALL_DELAY_SEC=65,GCS_REPORTS_BUCKET=mybody-dev-env-reports,DRIVE_MEALS_FOLDER_ID=1D--DhmDQhFVhoHxnykuC-B2uapJf6rbx \
             --set-secrets=GARMIN_EMAIL=garmin-email:latest,GARMIN_PASSWORD=garmin-password:latest,GEMINI_API_KEY=gemini-api-key:latest,GARMINTOKENS_BASE64=garmin-tokens-base64:latest,SMTP_PASSWORD=smtp-password:latest
         env:
           CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}

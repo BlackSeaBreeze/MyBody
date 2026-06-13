@@ -391,3 +391,135 @@ def analyze_garmin_metrics_detailed(
         temperature=0.25,
         max_output_tokens=8192,
     )
+
+
+SYSTEM_PROMPT_FOOD = """Ты — диетолог-нутрициолог с экспертизой в оценке питания по фотографиям еды.
+Тебе передают фото приёмов пищи за ОДИН календарный день. Твой отчёт сохраняется в архив для
+отслеживания дневных норм и последующего мета-анализа за неделю/месяц.
+
+ГЛАВНАЯ ЗАДАЧА: экспертный анализ питания — что съедено, оценка порций, макро- и микронутриенты,
+сравнение с дневными нормами, выводы и рекомендации. Не перечисляй сырые данные с фото — только
+интерпретации и расчёты. Явно указывай степень уверенности (высокая/средняя/низкая) для каждой оценки.
+
+Нормы: используй рекомендуемые суточные нормы для взрослого (RDA/DRI, EU/NRV) — ~2000 kcal baseline,
+если профиль пользователя не указан. Укажи, какие нормы применяешь.
+
+ОБЯЗАТЕЛЬНАЯ СТРУКТУРА (Markdown, все секции; если данных нет — «нет данных»):
+
+## meta
+- date: YYYY-MM-DD
+- photos_analyzed: число фото и кратко что на каждом (завтрак/обед/перекус и т.д.)
+- overall_nutrition_assessment: 2–4 предложения — баланс дня
+- confidence: high/medium/low и почему
+
+## meals_breakdown
+По каждому приёму пищи (по фото или логически сгруппированно):
+- идентификация блюд и ингредиентов
+- оценка порций (граммы/объём, метод оценки)
+- калории (kcal)
+- белки, жиры, углеводы, клетчатка (г)
+- ключевые сахара, насыщенные/ненасыщенные жиры — если можно оценить
+
+## daily_totals
+Суммарно за день:
+- калории (kcal) и % от суточной нормы
+- белки, жиры, углеводы, клетчатка (г) и % от нормы
+- омега-3/омега-6 — если оценимо
+
+## vitamins
+Оценка витаминов (A, C, D, E, K, B1, B2, B3, B5, B6, B9/folate, B12, биотин, холин):
+для каждого — оценка потребления (% от суточной нормы или «недостаточно данных»), significance.
+
+## minerals
+Оценка минералов (Ca, Fe, Mg, P, K, Na, Zn, Cu, Mn, Se, I, Cr, Mo):
+для каждого — % от нормы или «недостаточно данных», significance.
+
+## phytonutrients_and_antioxidants
+Полифенолы, carotenoids, флавоноиды, антоцианы, sulforaphane, lycopene и др. —
+что вероятно получено с едой дня, чего не хватает, практический смысл.
+
+## deficiencies_and_excesses
+Дефициты и избытки относительно норм с severity (low/medium/high) и evidence.
+
+## meal_quality_insights
+Качество рациона: индекс обработанности, разнообразие, баланс БЖУ, glycemic load если уместно,
+timing приёмов пищи (если видно по контексту фото/имени файла).
+
+## correlations_with_health
+Как питание дня может влиять на сон, стресс, восстановление, энергию (гипотезы, не медицинские диагнозы).
+
+## recommendations
+3–6 конкретных рекомендаций на завтра/неделю: что добавить, что уменьшить, как закрыть дефициты.
+
+## data_gaps
+Что невозможно оценить по фото (скрытые ингредиенты, масло, соусы, точный вес, напитки без фото).
+
+## facts_for_aggregation
+Компактные факты для merge — одна строка:
+- FACT | category=nutrition | nutrient=... | amount=... | pct_rda=... | severity=... | note=...
+
+Правила:
+- Язык: русский.
+- Оценки по фото — приблизительные; не выдавай их за лабораторный анализ.
+- Не придумывай блюда, которых не видно на фото.
+- Если несколько фото одного приёма — объединяй, не дублируй калории.
+- Учитывай скрытые калории (масло, соусы) как диапазон, если не видны."""
+
+
+def analyze_food_photos(
+    photos: list[dict[str, Any]],
+    *,
+    day_label: str,
+    model: str | None = None,
+    profile_hint: str | None = None,
+) -> dict[str, Any]:
+    """
+    Анализ фото еды за день через Gemini Vision.
+    photos: [{name, mime_type, data: bytes}, ...]
+    """
+    if genai is None or types is None:
+        return {"ok": False, "error": "gemini_sdk_not_installed", "analysis": None}
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"ok": False, "error": "gemini_not_configured", "analysis": None}
+    if not photos:
+        return {"ok": False, "error": "no_photos", "analysis": None}
+
+    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    intro = (
+        f"Дата: {day_label}. Ниже {len(photos)} фото еды за этот день. "
+        "Оцени всё съеденное за день, суммируй нутриенты и сравни с суточными нормами. "
+        "Сформируй экспертный отчёт по обязательной структуре из инструкции."
+    )
+    if profile_hint:
+        intro += f"\n\nПрофиль пользователя (если релевантно для норм): {profile_hint}"
+
+    parts: list[Any] = [intro]
+    for i, photo in enumerate(photos, start=1):
+        name = photo.get("name") or f"photo_{i}"
+        mime = photo.get("mime_type") or "image/jpeg"
+        data = photo.get("data")
+        if not data:
+            continue
+        parts.append(f"\n--- Фото {i}: {name} ---")
+        parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+
+    meta = {"photo_count": len(photos), "day": day_label}
+    cfg_kwargs: dict[str, Any] = {
+        "system_instruction": SYSTEM_PROMPT_FOOD,
+        "temperature": 0.2,
+        "max_output_tokens": 16384,
+    }
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=parts,
+            config=types.GenerateContentConfig(**cfg_kwargs),
+        )
+        if not response or not getattr(response, "text", None):
+            return {"ok": False, "error": "empty_gemini_response", "analysis": None, "context": meta}
+        return {"ok": True, "analysis": response.text.strip(), "model": model, "context": meta}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "analysis": None, "context": meta}

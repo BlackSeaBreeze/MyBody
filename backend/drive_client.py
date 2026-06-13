@@ -12,6 +12,7 @@ Share отдельной папки на «Мой диск» даёт list/get, 
 Переменные:
     DRIVE_SHORTS_FOLDER_ID    — папка Outcomes/Shorts
     DRIVE_DETAILED_FOLDER_ID  — папка Outcomes/Detailed
+    DRIVE_MEALS_FOLDER_ID     — корневая папка Meals (чтение фото; подпапки YYYY.MM.DD)
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ try:
     from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
-    from googleapiclient.http import MediaInMemoryUpload
+    from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 except ImportError:
     httplib2 = None  # type: ignore
     google = None  # type: ignore
@@ -35,6 +36,7 @@ except ImportError:
     build = None  # type: ignore
     HttpError = None  # type: ignore
     MediaInMemoryUpload = None  # type: ignore
+    MediaIoBaseDownload = None  # type: ignore
 
 _DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive",)
 _DRIVE_HTTP_TIMEOUT_SEC = 120
@@ -231,6 +233,243 @@ def _probe_one_folder(service, folder_id: str) -> dict[str, Any]:
 
     out["ok"] = True
     return out
+
+
+def is_meals_configured() -> bool:
+    """Drive API доступен и задан id папки Meals."""
+    if build is None:
+        return False
+    return bool(os.environ.get("DRIVE_MEALS_FOLDER_ID", "").strip())
+
+
+def _meals_folder_id() -> str:
+    return os.environ.get("DRIVE_MEALS_FOLDER_ID", "").strip()
+
+
+def meals_subfolder_name(day: str) -> str:
+    """ISO-дата YYYY-MM-DD → имя подпапки Meals на Drive (YYYY.MM.DD)."""
+    return day.strip().replace("-", ".")
+
+
+def _escape_drive_query(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _find_child_folder(service, parent_id: str, name: str) -> str | None:
+    escaped = _escape_drive_query(name)
+    q = (
+        f"'{parent_id}' in parents and name = '{escaped}' "
+        f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    resp = service.files().list(q=q, fields="files(id)", pageSize=1, **_LIST_KW).execute()
+    files = resp.get("files") or []
+    return files[0]["id"] if files else None
+
+
+def _list_folder_files(service, folder_id: str) -> list[dict[str, Any]]:
+    q = f"'{folder_id}' in parents and trashed = false"
+    files: list[dict[str, Any]] = []
+    page_token: str | None = None
+    while True:
+        resp = (
+            service.files()
+            .list(
+                q=q,
+                fields="nextPageToken,files(id,name,mimeType,size,createdTime)",
+                pageSize=100,
+                pageToken=page_token,
+                **_LIST_KW,
+            )
+            .execute()
+        )
+        files.extend(resp.get("files") or [])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
+
+
+def download_file_bytes(file_id: str) -> dict[str, Any]:
+    """Скачивает содержимое файла Drive."""
+    if build is None or MediaIoBaseDownload is None:
+        return {"ok": False, "error": "drive_sdk_not_installed"}
+    try:
+        import io
+
+        service = _service()
+        meta = (
+            service.files()
+            .get(fileId=file_id, fields="id,name,mimeType,size", **_FILE_KW)
+            .execute()
+        )
+        request = service.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return {
+            "ok": True,
+            "file_id": file_id,
+            "name": meta.get("name"),
+            "mime_type": meta.get("mimeType"),
+            "size": int(meta.get("size") or 0),
+            "data": buf.getvalue(),
+        }
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        return {"ok": False, "error": "drive_download_failed", "detail": str(e), "http_status": status}
+    except Exception as e:
+        return {"ok": False, "error": "drive_download_failed", "detail": str(e)}
+
+
+def fetch_day_meal_photos(
+    day: str,
+    *,
+    max_photos: int = 30,
+    max_bytes_per_file: int = 15_000_000,
+) -> dict[str, Any]:
+    """
+    Загружает фото еды из подпапки Meals/YYYY.MM.DD на Google Drive.
+    Возвращает список фото с байтами для передачи в Gemini Vision.
+    """
+    if build is None:
+        return {"ok": False, "error": "drive_sdk_not_installed"}
+    root_id = _meals_folder_id()
+    if not root_id:
+        return {"ok": False, "error": "drive_meals_folder_not_configured"}
+
+    folder_name = meals_subfolder_name(day)
+    out: dict[str, Any] = {
+        "ok": True,
+        "day": day,
+        "folder_name": folder_name,
+        "meals_root_id": root_id,
+        "photos": [],
+        "skipped": [],
+    }
+
+    try:
+        service = _service()
+        day_folder_id = _find_child_folder(service, root_id, folder_name)
+        if not day_folder_id:
+            out["folder_found"] = False
+            out["photo_count"] = 0
+            return out
+
+        out["folder_found"] = True
+        out["folder_id"] = day_folder_id
+        entries = _list_folder_files(service, day_folder_id)
+        image_entries = [
+            f
+            for f in entries
+            if (f.get("mimeType") or "") in _IMAGE_MIMES
+            and f.get("mimeType") != "application/vnd.google-apps.folder"
+        ]
+        image_entries.sort(key=lambda f: f.get("createdTime") or f.get("name") or "")
+
+        photos: list[dict[str, Any]] = []
+        for entry in image_entries:
+            if len(photos) >= max_photos:
+                out["skipped"].append({"name": entry.get("name"), "reason": "max_photos_reached"})
+                continue
+            size = int(entry.get("size") or 0)
+            if size > max_bytes_per_file:
+                out["skipped"].append({"name": entry.get("name"), "reason": "file_too_large", "size": size})
+                continue
+            downloaded = download_file_bytes(entry["id"])
+            if not downloaded.get("ok"):
+                out["skipped"].append(
+                    {"name": entry.get("name"), "reason": "download_failed", "error": downloaded.get("error")}
+                )
+                continue
+            photos.append(
+                {
+                    "file_id": entry["id"],
+                    "name": downloaded.get("name") or entry.get("name"),
+                    "mime_type": downloaded.get("mime_type"),
+                    "size": downloaded.get("size") or size,
+                    "data": downloaded["data"],
+                }
+            )
+
+        out["photos"] = photos
+        out["photo_count"] = len(photos)
+        return out
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        return {
+            "ok": False,
+            "error": "drive_meals_fetch_failed",
+            "detail": str(e),
+            "http_status": status,
+            "day": day,
+            "folder_name": folder_name,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "drive_meals_fetch_failed",
+            "detail": str(e),
+            "day": day,
+            "folder_name": folder_name,
+        }
+
+
+def probe_meals_access(day: str | None = None) -> dict[str, Any]:
+    """Диагностика чтения папки Meals и подпапки за день."""
+    if build is None:
+        return {"ok": False, "error": "drive_sdk_not_installed"}
+
+    root_id = _meals_folder_id()
+    if not root_id:
+        return {"ok": False, "error": "drive_meals_folder_not_configured"}
+
+    auth_source = "json" if os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "").strip() else "adc"
+    try:
+        creds = _credentials()
+        sa_email = _credential_email(creds)
+        service = _service()
+    except Exception as e:
+        return {"ok": False, "error": "credentials_failed", "detail": str(e), "auth_source": auth_source}
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "auth_source": auth_source,
+        "service_account_email": sa_email,
+        "meals_folder_id": root_id,
+    }
+
+    try:
+        meta = service.files().get(fileId=root_id, fields="id,name,mimeType", **_FILE_KW).execute()
+        result["meals_folder_name"] = meta.get("name")
+        result["meals_folder_visible"] = True
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        result["ok"] = False
+        result["meals_folder_visible"] = False
+        result["error"] = str(e)
+        result["http_status"] = status
+        return result
+
+    if day:
+        fetch = fetch_day_meal_photos(day, max_photos=5)
+        result["day_probe"] = {
+            "day": day,
+            "folder_name": fetch.get("folder_name"),
+            "folder_found": fetch.get("folder_found", False),
+            "photo_count": fetch.get("photo_count", 0),
+            "skipped": fetch.get("skipped"),
+            "ok": fetch.get("ok"),
+            "error": fetch.get("error"),
+        }
+        if not fetch.get("ok"):
+            result["ok"] = False
+
+    return result
 
 
 def probe_access() -> dict[str, Any]:
