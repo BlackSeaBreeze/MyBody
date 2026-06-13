@@ -58,6 +58,14 @@ def _credentials():
     return creds
 
 
+def _credential_email(creds) -> str | None:
+    for attr in ("service_account_email", "signer_email"):
+        val = getattr(creds, attr, None)
+        if val:
+            return str(val)
+    return None
+
+
 def _service():
     creds = _credentials()
     http = httplib2.Http(timeout=_DRIVE_HTTP_TIMEOUT_SEC)
@@ -135,11 +143,98 @@ def upload_text(
         }
 
 
-def upload_to_shorts(filename: str, content: str, mime_type: str = "text/html; charset=utf-8") -> dict[str, Any]:
+def upload_to_shorts(filename: str, content: str, mime_type: str = "text/html") -> dict[str, Any]:
     folder = os.environ.get("DRIVE_SHORTS_FOLDER_ID", "").strip()
     return upload_text(folder_id=folder, filename=filename, content=content, mime_type=mime_type)
 
 
-def upload_to_detailed(filename: str, content: str, mime_type: str = "text/markdown; charset=utf-8") -> dict[str, Any]:
+def upload_to_detailed(filename: str, content: str, mime_type: str = "text/markdown") -> dict[str, Any]:
     folder = os.environ.get("DRIVE_DETAILED_FOLDER_ID", "").strip()
     return upload_text(folder_id=folder, filename=filename, content=content, mime_type=mime_type)
+
+
+def _probe_one_folder(service, folder_id: str) -> dict[str, Any]:
+    probe_name = ".mybody-drive-probe.txt"
+    out: dict[str, Any] = {"folder_id": folder_id}
+    try:
+        meta = service.files().get(fileId=folder_id, fields="id,name,mimeType").execute()
+        out["folder_name"] = meta.get("name")
+        out["folder_visible"] = True
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        out["folder_visible"] = False
+        out["folder_error"] = str(e)
+        out["http_status"] = status
+        out["ok"] = False
+        return out
+
+    try:
+        service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            pageSize=1,
+            fields="files(id)",
+        ).execute()
+        out["list_ok"] = True
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        out["list_ok"] = False
+        out["list_error"] = str(e)
+        out["http_status"] = status
+        out["ok"] = False
+        return out
+
+    created = upload_text(
+        folder_id=folder_id,
+        filename=probe_name,
+        content="mybody drive probe",
+        mime_type="text/plain",
+    )
+    out["write"] = created
+    if not created.get("ok"):
+        out["ok"] = False
+        return out
+
+    try:
+        service.files().delete(fileId=created["file_id"]).execute()
+        out["probe_deleted"] = True
+    except HttpError as e:
+        out["probe_deleted"] = False
+        out["delete_error"] = str(e)
+
+    out["ok"] = True
+    return out
+
+
+def probe_access() -> dict[str, Any]:
+    """Диагностика Drive: SA email и пробная запись в Shorts/Detailed."""
+    if build is None:
+        return {"ok": False, "error": "drive_sdk_not_installed"}
+
+    auth_source = "json" if os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "").strip() else "adc"
+    try:
+        creds = _credentials()
+        sa_email = _credential_email(creds)
+        service = _service()
+    except Exception as e:
+        return {"ok": False, "error": "credentials_failed", "detail": str(e), "auth_source": auth_source}
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "auth_source": auth_source,
+        "service_account_email": sa_email,
+        "shorts_folder_id": os.environ.get("DRIVE_SHORTS_FOLDER_ID", "").strip(),
+        "detailed_folder_id": os.environ.get("DRIVE_DETAILED_FOLDER_ID", "").strip(),
+    }
+
+    checks: list[bool] = []
+    for key, env_name in (("shorts", "DRIVE_SHORTS_FOLDER_ID"), ("detailed", "DRIVE_DETAILED_FOLDER_ID")):
+        folder_id = os.environ.get(env_name, "").strip()
+        if not folder_id:
+            result[key] = {"ok": False, "error": "folder_id_not_set"}
+            continue
+        probe = _probe_one_folder(service, folder_id)
+        result[key] = probe
+        checks.append(bool(probe.get("ok")))
+
+    result["ok"] = bool(checks) and all(checks)
+    return result

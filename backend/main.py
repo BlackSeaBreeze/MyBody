@@ -501,6 +501,18 @@ def daily_report(
     return JSONResponse(result)
 
 
+@app.post("/internal/drive-probe")
+def drive_probe(x_cron_secret: str | None = Header(None, alias="X-Cron-Secret")):
+    """Диагностика Google Drive: SA email и пробная запись в папки Shorts/Detailed."""
+    secret = os.environ.get("CRON_SECRET", "").strip()
+    if secret and x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
+
+    result = drive_client.probe_access()
+    status = 200 if result.get("ok") else 502
+    return JSONResponse(result, status_code=status)
+
+
 @app.post("/internal/garmin-fetch")
 def garmin_fetch(
     days: int = 1,
