@@ -508,9 +508,18 @@ def _save_food_analysis(
         "photo_count": meals.get("photo_count", 0),
         "photos_skipped_count": meals.get("photos_skipped_count", 0),
         "analysis_complete": meals.get("analysis_complete", True),
+        "files_in_folder_count": len(meals.get("files_in_folder") or []),
+        "non_image_files": meals.get("non_image_files"),
         "skipped": meals.get("skipped"),
         "error": meals.get("error"),
     }
+    if meals.get("images_found", 0) > meals.get("photo_count", 0):
+        logger.warning(
+            "Meals: incomplete fetch for %s — loaded %s of %s images",
+            day_label,
+            meals.get("photo_count"),
+            meals.get("images_found"),
+        )
     if meals.get("photos_skipped_count"):
         logger.warning(
             "Meals: %s/%s photos skipped for %s: %s",

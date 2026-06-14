@@ -475,7 +475,23 @@ def _list_folder_files(service, folder_id: str) -> list[dict[str, Any]]:
     return files
 
 
-_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
+_IMAGE_MIMES = frozenset({
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/heic",
+    "image/heif",
+})
+
+
+def _is_meal_image(mime_type: str | None) -> bool:
+    mime = (mime_type or "").strip().lower()
+    if not mime or mime == "application/vnd.google-apps.folder":
+        return False
+    if mime in _IMAGE_MIMES:
+        return True
+    return mime.startswith("image/")
 
 try:
     from PIL import Image
@@ -687,13 +703,17 @@ def fetch_day_meal_photos(
         out["folder_found"] = True
         out["folder_id"] = day_folder_id
         entries = _list_folder_files(service, day_folder_id)
-        image_entries = [
-            f
+        out["files_in_folder"] = [
+            {"name": f.get("name"), "mimeType": f.get("mimeType"), "size": f.get("size")}
             for f in entries
-            if (f.get("mimeType") or "") in _IMAGE_MIMES
-            and f.get("mimeType") != "application/vnd.google-apps.folder"
         ]
-        image_entries.sort(key=lambda f: f.get("createdTime") or f.get("name") or "")
+        image_entries = [f for f in entries if _is_meal_image(f.get("mimeType"))]
+        out["non_image_files"] = [
+            {"name": f.get("name"), "mimeType": f.get("mimeType"), "size": f.get("size")}
+            for f in entries
+            if not _is_meal_image(f.get("mimeType"))
+        ]
+        image_entries.sort(key=lambda f: (f.get("name") or f.get("createdTime") or ""))
 
         photos: list[dict[str, Any]] = []
         total_bytes = 0
@@ -814,12 +834,17 @@ def probe_meals_access(day: str | None = None) -> dict[str, Any]:
         return result
 
     if day:
-        fetch = fetch_day_meal_photos(day, max_photos=5)
+        fetch = fetch_day_meal_photos(day)
         result["day_probe"] = {
             "day": day,
             "folder_name": fetch.get("folder_name"),
             "folder_found": fetch.get("folder_found", False),
+            "files_in_folder": fetch.get("files_in_folder"),
+            "non_image_files": fetch.get("non_image_files"),
+            "images_found": fetch.get("images_found", 0),
             "photo_count": fetch.get("photo_count", 0),
+            "photos_skipped_count": fetch.get("photos_skipped_count", 0),
+            "analysis_complete": fetch.get("analysis_complete"),
             "skipped": fetch.get("skipped"),
             "ok": fetch.get("ok"),
             "error": fetch.get("error"),

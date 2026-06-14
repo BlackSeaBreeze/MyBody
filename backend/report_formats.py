@@ -111,6 +111,8 @@ def build_food_report_md(
         "drive_folder": pm.get("folder_name"),
         "photo_names": [p.get("name") for p in (pm.get("photos") or []) if p.get("name")],
         "photos_skipped": pm.get("skipped") or [],
+        "non_image_files": pm.get("non_image_files") or [],
+        "files_in_folder_count": len(pm.get("files_in_folder") or []),
     }
 
     meta_json = json.dumps(frontmatter, ensure_ascii=False, indent=2)
