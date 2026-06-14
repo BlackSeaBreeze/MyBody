@@ -85,12 +85,32 @@ def _model_chain(preferred: str) -> list[str]:
     return chain
 
 
+def _model_chain_food(preferred: str) -> list[str]:
+    """Цепочка моделей для food: без *-lite до исчерпания полноценных (lite часто ломает суммирование БЖУ)."""
+    chain: list[str] = []
+    for name in (
+        preferred.strip(),
+        os.environ.get("GEMINI_MODEL_FOOD_FALLBACK", "").strip(),
+        os.environ.get("GEMINI_MODEL_FALLBACK", "").strip(),
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ):
+        if name and "lite" not in name.lower() and name not in chain:
+            chain.append(name)
+    if os.environ.get("GEMINI_FOOD_ALLOW_LITE", "").strip().lower() in ("1", "true", "yes"):
+        for name in ("gemini-2.5-flash-lite", "gemini-2.0-flash-lite"):
+            if name not in chain:
+                chain.append(name)
+    return chain or _model_chain(preferred)
+
+
 def _generate_with_retry(
     *,
     contents: Any,
     config: Any,
     model: str,
     context_meta: dict[str, Any] | None = None,
+    model_chain: list[str] | None = None,
 ) -> dict[str, Any]:
     """Вызов Gemini с retry (429/503) и fallback на другие модели при дневной квоте."""
     meta: dict[str, Any] = dict(context_meta or {})
@@ -104,8 +124,9 @@ def _generate_with_retry(
     last_error = ""
     models_tried: list[str] = []
     max_retries = _max_gemini_retries()
+    chain = model_chain or _model_chain(model)
 
-    for try_model in _model_chain(model):
+    for try_model in chain:
         for attempt in range(max_retries):
             try:
                 response = client.models.generate_content(
@@ -595,15 +616,26 @@ SYSTEM_PROMPT_FOOD = """Ты — диетолог-нутрициолог с эк
 По каждому приёму пищи (по фото или логически сгруппированно):
 - идентификация блюд и ингредиентов
 - оценка порций (граммы/объём, метод оценки)
-- калории (kcal)
-- белки, жиры, углеводы, клетчатка (г)
 - ключевые сахара, насыщенные/ненасыщенные жиры — если можно оценить
+- **БЖУ строка (обязательна в конце каждого приёма, числа для суммирования):**
+  `БЖУ: kcal N | белок N г | жир N г | углев N г | клетчатка N г`
+
+## arithmetic_check
+**Заполни ДО daily_totals.** Таблица суммирования всех строк БЖУ из meals_breakdown:
+
+| Приём пищи | kcal | белок г | жир г | углев г | клетчатка г |
+|------------|------|---------|-------|---------|-------------|
+| ...        | ...  | ...     | ...   | ...     | ...         |
+| **СУММА**  | X    | Y       | Z     | W       | F           |
+
+Под таблицей — явное сложение: «150 + 750 + … = X kcal» (хотя бы для калорий и белка).
 
 ## daily_totals
-Суммарно за день:
-- калории (kcal) и % от суточной нормы
-- белки, жиры, углеводы, клетчатка (г) и % от нормы
+Суммарно за день — **только цифры из строки СУММА в arithmetic_check** (не округляй заново, не «примерно»):
+- калории (kcal) = X из СУММЫ; % от суточной нормы
+- белки, жиры, углеводы, клетчатка (г) = из СУММЫ; % от нормы
 - омега-3/омега-6 — если оценимо
+- если daily_totals не совпадает с СУММОЙ — исправь daily_totals, не meals_breakdown
 
 ## vitamins
 Оценка витаминов (A, C, D, E, K, B1, B2, B3, B5, B6, B9/folate, B12, биотин, холин):
@@ -675,6 +707,16 @@ timing приёмов пищи (если видно по контексту фо
 - Если этикетка частично нечитаема — дай диапазон и пометь confidence: low; не выдавай точные цифры за факт.
 - Объёмы «на глаз» (сливки в кофе, масло): используй визуальные подсказки (цвет, слои, размер посуды);
   при сомнении — диапазон (например 25–35 мл), не завышай до верхней границы без оснований.
+- **Жиры в жидкостях:** жир (г) = объём_мл × (жирность_% / 100). Сливки Fresh Cream / cooking cream ~30–38%:
+  30 мл при 35% ≈ 10.5 г жира, не 3 г. Укажи % с упаковки или обоснуй оценку.
+
+АРИФМЕТИКА И СОГЛАСОВАННОСТЬ (критично — частая ошибка моделей):
+- Сначала meals_breakdown (каждый приём с БЖУ строкой) → arithmetic_check (таблица + СУММА) → daily_totals (= СУММА).
+- **Запрещено** писать в daily_totals числа, которые не равны СУММЕ (допуск ±3% только на клетчатку).
+- deficiencies_and_excesses, microbiome_impact, overall_nutrition_assessment — **только из daily_totals после arithmetic_check**,
+  не из «ощущений» и не из устаревших промежуточных оценок.
+- Если клетчатка в СУММЕ ≥25 г — не пиши «критический дефicit клетчатки».
+- Не дублируй один приём дважды в таблице; не пропускай приёмы из meals_breakdown.
 
 ПОЛНОТА АНАЛИЗА (критично):
 - Обработай КАЖДОЕ переданное фото по порядку, прежде чем считать daily_totals.
@@ -739,8 +781,8 @@ def analyze_food_photos(
     intro = (
         f"Дата: {day_label}.\n\n"
         f"=== Манифест фото ===\n{manifest}\n\n"
-        f"Ниже {len(photos)} изображений. Сначала разбери КАЖДОЕ фото (meals_breakdown), "
-        "затем суммируй daily_totals. "
+        f"Ниже {len(photos)} изображений. Сначала разбери КАЖДОЕ фото (meals_breakdown с БЖУ строкой), "
+        "затем arithmetic_check (таблица + СУММА), затем daily_totals = СУММА без расхождений. "
         "На упакованных продуктах читай этикетку с фото буквально, не угадывай по категории. "
         "На фото тарелок и блюд — визуально оценивай состав, объём порций и калории (это полноценные изображения, не OCR). "
         "Сформируй отчёт по обязательной структуре из инструкции."
@@ -783,6 +825,7 @@ def analyze_food_photos(
         ),
         model=model,
         context_meta=meta,
+        model_chain=_model_chain_food(model),
     )
 
 
@@ -811,6 +854,8 @@ SYSTEM_PROMPT_COMBINED = """Ты — персональный health-coach: сп
 
 ## nutrition_key_points
 Главное из питания — списком с тегами и **метками:** как выше.
+Опирайся на **daily_totals / arithmetic_check** из архива питания, не пересчитывай заново и не занижай калории/белок,
+если в meals_breakdown сумма выше.
 
 ## cross_domain_insights
 Минимум 4 связи «Garmin ↔ питание ↔ заметки», с соблюдением хронологии Garmin:
