@@ -147,6 +147,102 @@ def extract_analysis_section(md: str) -> str:
     return md[idx + len(marker) :].strip()
 
 
+def extract_food_frontmatter(md: str) -> dict[str, Any]:
+    """JSON из блока метаданных food-отчёта; пустой dict если не найден."""
+    m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", md)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(1))
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+_BJU_LINE_RE = re.compile(
+    r"БЖУ:\s*kcal\s+([\d.]+)\s*\|\s*белок\s+([\d.]+)\s*г\s*\|\s*жир\s+([\d.]+)\s*г\s*"
+    r"\|\s*углев\s+([\d.]+)\s*г\s*\|\s*клетчатка\s+([\d.]+)\s*г",
+    re.I,
+)
+_DAILY_TOTALS_BLOCK_RE = re.compile(r"## daily_totals\b([\s\S]*?)(?=^## |\Z)", re.I | re.M)
+_DAILY_KCAL_RE = re.compile(r"\*\*Калории:\*\*\s*~?\s*([\d.]+)", re.I)
+_DAILY_PROTEIN_RE = re.compile(r"\*\*Белки:\*\*\s*~?\s*([\d.]+)", re.I)
+
+
+def validate_food_arithmetic(analysis: str) -> dict[str, Any]:
+    """
+    Сверяет строки БЖУ из meals_breakdown с daily_totals.
+    Возвращает sums, reported, issues — для предупреждений в архиве и email.
+    """
+    issues: list[str] = []
+    rows: list[tuple[float, float, float, float, float]] = []
+    for m in _BJU_LINE_RE.finditer(analysis):
+        rows.append(tuple(float(m.group(i)) for i in range(1, 6)))
+
+    if not rows:
+        if "## arithmetic_check" not in analysis.lower():
+            issues.append("нет секции arithmetic_check и строк «БЖУ: kcal …» — суммы могут быть неточны")
+        return {"ok": False, "issues": issues, "bju_rows": 0}
+
+    sums = {
+        "kcal": round(sum(r[0] for r in rows), 1),
+        "protein_g": round(sum(r[1] for r in rows), 1),
+        "fat_g": round(sum(r[2] for r in rows), 1),
+        "carbs_g": round(sum(r[3] for r in rows), 1),
+        "fiber_g": round(sum(r[4] for r in rows), 1),
+    }
+    reported: dict[str, float] = {}
+    dt = _DAILY_TOTALS_BLOCK_RE.search(analysis)
+    if dt:
+        block = dt.group(1)
+        km = _DAILY_KCAL_RE.search(block)
+        pm = _DAILY_PROTEIN_RE.search(block)
+        if km:
+            reported["kcal"] = float(km.group(1))
+        if pm:
+            reported["protein_g"] = float(pm.group(1))
+
+    def _pct_diff(reported_val: float, sum_val: float) -> float:
+        if sum_val <= 0:
+            return 100.0
+        return abs(reported_val - sum_val) / sum_val * 100.0
+
+    for key, label, tol in (
+        ("kcal", "калории", 5.0),
+        ("protein_g", "белок", 8.0),
+    ):
+        if key in reported and _pct_diff(reported[key], sums[key]) > tol:
+            issues.append(
+                f"daily_totals ({label} {reported[key]}) расходится с суммой БЖУ ({sums[key]}) "
+                f"более чем на {tol:.0f}%"
+            )
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "bju_rows": len(rows),
+        "sums": sums,
+        "reported": reported,
+    }
+
+
+def food_arithmetic_warning(analysis: str) -> str | None:
+    """Краткое предупреждение для вставки в отчёт, если арифметика не сходится."""
+    v = validate_food_arithmetic(analysis)
+    if v.get("ok"):
+        return None
+    parts = ["⚠ **Автопроверка арифметики:**"]
+    for issue in v.get("issues") or []:
+        parts.append(f"- {issue}")
+    if v.get("sums"):
+        s = v["sums"]
+        parts.append(
+            f"- Сумма по строкам БЖУ: {s['kcal']} kcal, белок {s['protein_g']} г "
+            f"(используйте эти цифры, если daily_totals расходится)."
+        )
+    return "\n".join(parts)
+
+
 _SECTION_TITLES: dict[str, str] = {
     "executive_summary": "Краткий итог",
     "garmin_key_points": "Garmin — главное",

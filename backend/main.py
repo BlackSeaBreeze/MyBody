@@ -556,9 +556,17 @@ def _save_food_analysis(
         logger.error("Food Gemini analysis failed: %s", food.get("error"))
         return
 
+    food_analysis_text = food["analysis"]
+    arith = report_formats.validate_food_arithmetic(food_analysis_text)
+    result["food_arithmetic_check"] = arith
+    arith_warn = report_formats.food_arithmetic_warning(food_analysis_text)
+    if arith_warn:
+        logger.warning("Food arithmetic check failed: %s", arith.get("issues"))
+        food_analysis_text = arith_warn + "\n\n" + food_analysis_text
+
     food_md = report_formats.build_food_report_md(
         day_label=day_label,
-        food_analysis=food["analysis"],
+        food_analysis=food_analysis_text,
         model=food.get("model") or gemini_client.model_for_step("food", model),
         photo_meta=meals,
         context_meta=food.get("context"),
@@ -690,16 +698,60 @@ def daily_report(
                 "object": result.get("food_archive_object"),
                 "source": "current_run",
             }
+        elif result.get("food_analysis_error"):
+            result["food_archive_used"] = {
+                "ok": False,
+                "error": "food_analysis_failed",
+                "detail": "Stale GCS archive skipped — food step failed this run",
+                "source": "none",
+            }
+            logger.warning(
+                "Skipping stale food archive for %s: food analysis failed (%s)",
+                day_label,
+                str(result.get("food_analysis_error", ""))[:120],
+            )
         else:
             food_archive = storage_client.get_latest_food_analysis_for_day(day_label)
             if food_archive.get("ok"):
                 food_analysis_text = report_formats.extract_analysis_section(food_archive["content"])
+                fm = report_formats.extract_food_frontmatter(food_archive["content"])
+                stale_model = str(fm.get("model") or "")
+                stale_generated = fm.get("generated_at_utc")
+                stale_photos = fm.get("photos_analyzed")
+                current_found = (result.get("meals_fetch") or {}).get("images_found")
+                stale_incomplete = (
+                    "lite" in stale_model.lower()
+                    or fm.get("analysis_complete") is False
+                    or (
+                        current_found
+                        and stale_photos
+                        and int(stale_photos) < int(current_found)
+                    )
+                )
                 result["food_archive_used"] = {
                     "object": food_archive.get("object"),
                     "gs_uri": food_archive.get("gs_uri"),
                     "candidates_count": food_archive.get("candidates_count"),
                     "source": "gcs_latest",
+                    "stale_model": stale_model or None,
+                    "stale_generated_at_utc": stale_generated,
+                    "stale_photos_analyzed": stale_photos,
+                    "stale_incomplete": stale_incomplete,
                 }
+                if stale_incomplete:
+                    food_analysis_text = (
+                        f"⚠ Используется устаревший архив питания ({stale_generated or 'unknown'}, "
+                        f"модель {stale_model or '?'}, фото {stale_photos or '?'}). "
+                        f"Перезапустите food-анализ после сброса квоты Gemini.\n\n"
+                        + food_analysis_text
+                    )
+                    logger.warning(
+                        "Stale incomplete food archive for %s: model=%s photos=%s/%s",
+                        day_label,
+                        stale_model,
+                        stale_photos,
+                        current_found,
+                    )
             else:
                 result["food_archive_used"] = {
                     "ok": False,
