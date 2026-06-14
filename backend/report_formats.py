@@ -12,17 +12,22 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 
-def drive_file_stem(*, timezone: str | None = None) -> str:
+def drive_file_stem(*, day_label: str | None = None, timezone: str | None = None) -> str:
     """
     Имя файла без расширения: vb-YYYYMMDD-hhmm (24ч) в часовом поясе отчёта.
-    По умолчанию REPORT_TIMEZONE=Europe/Dublin (как Cloud Scheduler).
+    YYYYMMDD — календарный день отчёта (day_label), hhmm — время запуска.
     """
     tz_name = (timezone or os.environ.get("REPORT_TIMEZONE", "Europe/Dublin")).strip() or "Europe/Dublin"
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("Europe/Dublin")
-    return datetime.now(tz).strftime("vb-%Y%m%d-%H%M")
+    now = datetime.now(tz)
+    if day_label:
+        date_part = day_label.strip().replace("-", "")
+    else:
+        date_part = now.strftime("%Y%m%d")
+    return f"vb-{date_part}-{now.strftime('%H%M')}"
 
 
 def build_detailed_report_md(

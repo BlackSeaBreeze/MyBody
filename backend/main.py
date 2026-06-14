@@ -566,6 +566,8 @@ def _save_food_analysis(
     food_name = f"{file_stem}-food.md"
     food_up = storage_client.upload_to_archive(food_name, food_md)
     result["storage_archive_food"] = food_up
+    result["food_archive_content"] = food_md
+    result["food_archive_object"] = food_up.get("object") if food_up.get("ok") else food_name
     if food_up.get("ok"):
         logger.info("GCS archive food saved: %s", food_up.get("gs_uri"))
     else:
@@ -603,7 +605,7 @@ def daily_report(
     metrics = garmin_client.fetch_daily_metrics(day=day)
     day_label = str(metrics.get("to") or day or "сегодня")
     gemini_override = model.strip() if model else None
-    file_stem = report_formats.drive_file_stem()
+    file_stem = report_formats.drive_file_stem(day_label=day_label)
     result: dict = {
         "ok": bool(metrics.get("ok")),
         "day": day_label,
@@ -672,11 +674,40 @@ def daily_report(
 
         result["gemini_inter_call_delay_sec"] = _gemini_sleep()
 
-        # 3) Последний food-архив за день + сырые Garmin → итоговый отчёт
-        food_archive = storage_client.get_latest_food_analysis_for_day(day_label)
+        # 3) Food-архив (только что сохранённый) + сырые Garmin → итоговый отчёт
+        food_archive: dict[str, Any] = {}
         food_analysis_text: str | None = None
-        if food_archive.get("ok"):
-            food_analysis_text = report_formats.extract_analysis_section(food_archive["content"])
+        food_archive_content = result.get("food_archive_content")
+        if food_archive_content:
+            food_analysis_text = report_formats.extract_analysis_section(food_archive_content)
+            food_archive = {
+                "ok": True,
+                "content": food_archive_content,
+                "object": result.get("food_archive_object"),
+                "source": "current_run",
+            }
+            result["food_archive_used"] = {
+                "object": result.get("food_archive_object"),
+                "source": "current_run",
+            }
+        else:
+            food_archive = storage_client.get_latest_food_analysis_for_day(day_label)
+            if food_archive.get("ok"):
+                food_analysis_text = report_formats.extract_analysis_section(food_archive["content"])
+                result["food_archive_used"] = {
+                    "object": food_archive.get("object"),
+                    "gs_uri": food_archive.get("gs_uri"),
+                    "candidates_count": food_archive.get("candidates_count"),
+                    "source": "gcs_latest",
+                }
+            else:
+                result["food_archive_used"] = {
+                    "ok": False,
+                    "error": food_archive.get("error"),
+                }
+                logger.warning("No food archive for combined report: %s", food_archive.get("error"))
+
+        if food_analysis_text:
             mf = result.get("meals_fetch") or {}
             if mf.get("photos_skipped_count") or mf.get("analysis_complete") is False:
                 skipped_n = mf.get("photos_skipped_count") or 0
@@ -686,17 +717,6 @@ def daily_report(
                     f"({skipped_n} пропущено при загрузке). Выводы по калориям/дефицитам могут быть занижены.\n\n"
                     + food_analysis_text
                 )
-            result["food_archive_used"] = {
-                "object": food_archive.get("object"),
-                "gs_uri": food_archive.get("gs_uri"),
-                "candidates_count": food_archive.get("candidates_count"),
-            }
-        else:
-            result["food_archive_used"] = {
-                "ok": False,
-                "error": food_archive.get("error"),
-            }
-            logger.warning("No food archive for combined report: %s", food_archive.get("error"))
 
         combined = gemini_client.analyze_daily_combined(
             metrics,
