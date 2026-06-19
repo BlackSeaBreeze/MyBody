@@ -392,10 +392,8 @@ def _report_calendar_day() -> Any:
 
 def _default_report_day() -> Any:
     """
-    День отчёта по умолчанию (когда day= не передан).
-    До REPORT_DAY_CUTOFF_HOUR — вчера (ручной запуск после полуночи).
-    После cutoff — сегодня (cron в 23:45).
-    REPORT_DAY_OFFSET (например -1) переопределяет сдвиг от «сегодня».
+    День утреннего отчёта по умолчанию (когда day= не передан) — дата пробуждения (сегодня).
+    REPORT_DAY_OFFSET (например -1) сдвигает от «сегодня» в REPORT_TIMEZONE.
     """
     today = _report_calendar_day()
     env_offset = os.environ.get("REPORT_DAY_OFFSET", "").strip()
@@ -404,33 +402,29 @@ def _default_report_day() -> Any:
             return today + timedelta(days=int(env_offset))
         except ValueError:
             pass
-
-    now = datetime.now(_report_timezone())
-    try:
-        cutoff = int(os.environ.get("REPORT_DAY_CUTOFF_HOUR", "12"))
-    except ValueError:
-        cutoff = 12
-    cutoff = max(0, min(23, cutoff))
-    if now.hour < cutoff:
-        return today - timedelta(days=1)
     return today
 
 
 def fetch_daily_metrics(day: str | None = None) -> dict[str, Any]:
     """
-    Загружает все метрики за один календарный день.
-    По умолчанию — _default_report_day() (до полудня вчера, иначе сегодня; см. REPORT_DAY_CUTOFF_HOUR).
-    Сон Garmin привязан к дате пробуждения: для «сегодня» в 23:45 это прошедшая ночь.
+    Метрики для утреннего отчёта за дату пробуждения D (report_day).
+    Загружает D−1 и D: активность/стресс за вчера, sleep_data за D — прошедшая ночь.
     """
     api, client_err, client_detail = get_client()
     if api is None:
         return _client_error_payload(client_err, client_detail)
     try:
         if day:
-            target = datetime.fromisoformat(day).date()
+            report_day = datetime.fromisoformat(day).date()
         else:
-            target = _default_report_day()
-        return _collect_metrics_range(api, target, target)
+            report_day = _default_report_day()
+        activity_day = report_day - timedelta(days=1)
+        payload = _collect_metrics_range(api, activity_day, report_day)
+        payload["report_day"] = report_day.isoformat()
+        payload["activity_day"] = activity_day.isoformat()
+        payload["food_day"] = activity_day.isoformat()
+        payload["sleep_day"] = report_day.isoformat()
+        return payload
     except Exception as e:
         return {"ok": False, "error": str(e), "metrics_by_day": None}
 

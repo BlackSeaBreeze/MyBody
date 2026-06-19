@@ -458,6 +458,62 @@ def _profile_hint_from_metrics(metrics: dict) -> str | None:
     return "; ".join(parts) if parts else None
 
 
+def _load_medical_data(result: dict) -> str | None:
+    """Читает медицинские данные из Drive Notes/medical_data; возвращает текст или None."""
+    if not drive_client.is_notes_configured():
+        result["medical_data_skipped"] = "drive_notes_not_configured"
+        return None
+
+    notes = drive_client.fetch_medical_data()
+    result["medical_data_fetch"] = {
+        "ok": notes.get("ok"),
+        "filename": notes.get("filename"),
+        "file_found": notes.get("file_found"),
+        "char_count": notes.get("char_count", 0),
+        "mime_type": notes.get("mime_type"),
+        "error": notes.get("error"),
+    }
+    if not notes.get("ok"):
+        logger.error("Medical data fetch failed: %s", notes.get("error"))
+        return None
+    if not notes.get("file_found"):
+        result["medical_data_skipped"] = "file_not_found"
+        return None
+    text = notes.get("text")
+    if not text or not str(text).strip():
+        result["medical_data_skipped"] = "empty_file"
+        return None
+    return str(text).strip()
+
+
+def _load_general_notes(result: dict) -> str | None:
+    """Читает постоянные пожелания из Drive Notes/general; возвращает текст или None."""
+    if not drive_client.is_notes_configured():
+        result["general_notes_skipped"] = "drive_notes_not_configured"
+        return None
+
+    notes = drive_client.fetch_general_notes()
+    result["general_notes_fetch"] = {
+        "ok": notes.get("ok"),
+        "filename": notes.get("filename"),
+        "file_found": notes.get("file_found"),
+        "char_count": notes.get("char_count", 0),
+        "mime_type": notes.get("mime_type"),
+        "error": notes.get("error"),
+    }
+    if not notes.get("ok"):
+        logger.error("General notes fetch failed: %s", notes.get("error"))
+        return None
+    if not notes.get("file_found"):
+        result["general_notes_skipped"] = "file_not_found"
+        return None
+    text = notes.get("text")
+    if not text or not str(text).strip():
+        result["general_notes_skipped"] = "empty_file"
+        return None
+    return str(text).strip()
+
+
 def _load_daily_notes(day_label: str, result: dict) -> str | None:
     """Читает заметки за день из Drive Notes/YYYY.MM.DD; возвращает текст или None."""
     if not drive_client.is_notes_configured():
@@ -493,8 +549,11 @@ def _save_food_analysis(
     model: str | None,
     metrics: dict,
     result: dict,
+    report_day: str | None = None,
+    general_notes: str | None = None,
+    medical_notes: str | None = None,
 ) -> None:
-    """Загружает фото еды из Drive, анализирует Gemini, сохраняет в GCS archive."""
+    """Загружает фото еды из Drive за food_day (вчера), анализирует Gemini, сохраняет в GCS archive."""
     if not drive_client.is_meals_configured():
         result["meals_skipped"] = "drive_meals_not_configured"
         return
@@ -545,8 +604,11 @@ def _save_food_analysis(
     food = gemini_client.analyze_food_photos(
         meals["photos"],
         day_label=day_label,
+        report_day=report_day,
         model=model,
         profile_hint=_profile_hint_from_metrics(metrics),
+        general_notes=general_notes,
+        medical_notes=medical_notes,
         fetch_meta=meals,
     )
     result["food_analysis_ok"] = bool(food.get("ok"))
@@ -592,13 +654,14 @@ def daily_report(
     x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
 ):
     """
-    Ежедневный отчёт за один календарный день.
-    По умолчанию: до 12:00 (REPORT_DAY_CUTOFF_HOUR) в REPORT_TIMEZONE — вчера,
-    иначе сегодня (cron в 23:45). Явно: ?day=YYYY-MM-DD.
+    Утренний отчёт после пробуждения (report_day = D).
+    По умолчанию D — сегодня в REPORT_TIMEZONE. Явно: ?day=YYYY-MM-DD (дата пробуждения).
+
+    Источники: Garmin активность и заметки за D−1; фото еды за D−1; сон — прошедшая ночь (sleep_data на D).
 
     Порядок:
-    1) Garmin + заметки за день → Gemini → archive/vb-….md
-    2) Фото еды → archive/vb-…-food.md
+    1) Garmin + заметки за вчера → Gemini → archive/vb-….md
+    2) Фото еды за вчера → archive/vb-…-food.md
     3) Garmin + food-архив + заметки → итоговый Gemini → outcomes/vb-….html + email
 
     Вызов защищён: при заданном CRON_SECRET требуется заголовок X-Cron-Secret.
@@ -611,12 +674,16 @@ def daily_report(
         raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
 
     metrics = garmin_client.fetch_daily_metrics(day=day)
-    day_label = str(metrics.get("to") or day or "сегодня")
+    day_label = str(metrics.get("report_day") or metrics.get("to") or day or "сегодня")
+    food_day = str(metrics.get("food_day") or day_label)
     gemini_override = model.strip() if model else None
     file_stem = report_formats.drive_file_stem(day_label=day_label)
     result: dict = {
         "ok": bool(metrics.get("ok")),
         "day": day_label,
+        "report_day": day_label,
+        "food_day": food_day,
+        "activity_day": str(metrics.get("activity_day") or food_day),
         "file_stem": file_stem,
         "model": gemini_override or gemini_client.DEFAULT_GEMINI_MODEL,
         "models": {
@@ -638,7 +705,9 @@ def daily_report(
     html_body = ""
     combined: dict = {"ok": False, "error": "not_run"}
     food_archive: dict[str, Any] = {}
-    daily_notes = _load_daily_notes(day_label, result)
+    daily_notes = _load_daily_notes(food_day, result)
+    general_notes = _load_general_notes(result)
+    medical_notes = _load_medical_data(result)
 
     if save_reports and storage_client.is_configured():
         # 1) Garmin + заметки — архивный экспертный анализ (один вызов Gemini)
@@ -646,6 +715,8 @@ def daily_report(
             metrics,
             model=gemini_override,
             daily_notes=daily_notes,
+            general_notes=general_notes,
+            medical_notes=medical_notes,
         )
         result["detailed_analysis_ok"] = bool(detailed.get("ok"))
         _note_gemini_failure(result, detailed, "archive")
@@ -673,11 +744,14 @@ def daily_report(
 
         # 2) Еда → archive/vb-…-food.md
         _save_food_analysis(
-            day_label=day_label,
+            day_label=food_day,
             file_stem=file_stem,
+            report_day=day_label,
             model=gemini_override,
             metrics=metrics,
             result=result,
+            general_notes=general_notes,
+            medical_notes=medical_notes,
         )
 
         result["gemini_inter_call_delay_sec"] = _gemini_sleep()
@@ -775,6 +849,9 @@ def daily_report(
             food_analysis=food_analysis_text,
             daily_notes=daily_notes,
             day_label=day_label,
+            food_day=food_day,
+            general_notes=general_notes,
+            medical_notes=medical_notes,
             model=gemini_override,
         )
         result["combined_analysis_ok"] = bool(combined.get("ok"))
@@ -877,7 +954,7 @@ def notes_probe(
     day: str | None = None,
     x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
 ):
-    """Диагностика чтения папки Notes на Google Drive (опционально — файл за day=YYYY-MM-DD)."""
+    """Диагностика чтения папки Notes (general, medical_data + опционально day=YYYY-MM-DD)."""
     secret = os.environ.get("CRON_SECRET", "").strip()
     if secret and x_cron_secret != secret:
         raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")

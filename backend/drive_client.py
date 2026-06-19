@@ -13,7 +13,10 @@ Share отдельной папки на «Мой диск» даёт list/get, 
     DRIVE_SHORTS_FOLDER_ID    — папка Outcomes/Shorts
     DRIVE_DETAILED_FOLDER_ID  — папка Outcomes/Detailed
     DRIVE_MEALS_FOLDER_ID     — корневая папка Meals (чтение фото; подпапки YYYY.MM.DD)
-    DRIVE_NOTES_FOLDER_ID     — папка Notes (файлы YYYY.MM.DD — Google Docs или текст)
+    DRIVE_NOTES_FOLDER_ID     — папка Notes (файлы YYYY.MM.DD — Google Docs или текст;
+                               general — постоянные пожелания; medical_data — анализы и мед. данные)
+    DRIVE_NOTES_GENERAL_FILENAME — имя general-файла в Notes (по умолчанию general)
+    DRIVE_NOTES_MEDICAL_FILENAME — имя medical-файла в Notes (по умолчанию medical_data)
 """
 from __future__ import annotations
 
@@ -298,25 +301,31 @@ def _read_drive_file_text(service, file_id: str, mime_type: str) -> tuple[str | 
         return None, str(e)
 
 
-def fetch_day_notes(day: str) -> dict[str, Any]:
-    """
-    Загружает заметки за день из папки Notes: файл с именем YYYY.MM.DD (Google Docs или текст).
-    """
+def _general_notes_filename() -> str:
+    return (os.environ.get("DRIVE_NOTES_GENERAL_FILENAME", "general") or "general").strip()
+
+
+def _medical_notes_filename() -> str:
+    return (os.environ.get("DRIVE_NOTES_MEDICAL_FILENAME", "medical_data") or "medical_data").strip()
+
+
+def _fetch_notes_by_filename(filename: str, *, day: str | None = None) -> dict[str, Any]:
+    """Читает Google Doc или текстовый файл по имени из папки Notes."""
     if build is None:
         return {"ok": False, "error": "drive_sdk_not_installed"}
     root_id = _notes_folder_id()
     if not root_id:
         return {"ok": False, "error": "drive_notes_folder_not_configured"}
 
-    filename = meals_subfolder_name(day)
     out: dict[str, Any] = {
         "ok": True,
-        "day": day,
         "filename": filename,
         "notes_root_id": root_id,
         "file_found": False,
         "text": None,
     }
+    if day:
+        out["day"] = day
 
     try:
         service = _service()
@@ -332,15 +341,17 @@ def fetch_day_notes(day: str) -> dict[str, Any]:
         mime_type = meta.get("mimeType") or ""
         text, read_err = _read_drive_file_text(service, file_id, mime_type)
         if read_err:
-            return {
+            err: dict[str, Any] = {
                 "ok": False,
                 "error": "drive_notes_read_failed",
                 "detail": read_err,
-                "day": day,
                 "filename": filename,
                 "file_id": file_id,
                 "mime_type": mime_type,
             }
+            if day:
+                err["day"] = day
+            return err
         if text is None:
             text = ""
 
@@ -364,22 +375,54 @@ def fetch_day_notes(day: str) -> dict[str, Any]:
         return out
     except HttpError as e:
         status = getattr(getattr(e, "resp", None), "status", None)
-        return {
+        err = {
             "ok": False,
             "error": "drive_notes_fetch_failed",
             "detail": str(e),
             "http_status": status,
-            "day": day,
             "filename": filename,
         }
+        if day:
+            err["day"] = day
+        return err
     except Exception as e:
-        return {
+        err = {
             "ok": False,
             "error": "drive_notes_fetch_failed",
             "detail": str(e),
-            "day": day,
             "filename": filename,
         }
+        if day:
+            err["day"] = day
+        return err
+
+
+def fetch_day_notes(day: str) -> dict[str, Any]:
+    """
+    Загружает заметки за день из папки Notes: файл с именем YYYY.MM.DD (Google Docs или текст).
+    """
+    filename = meals_subfolder_name(day)
+    result = _fetch_notes_by_filename(filename, day=day)
+    if result.get("ok"):
+        result.setdefault("day", day)
+        result.setdefault("filename", filename)
+    return result
+
+
+def fetch_general_notes() -> dict[str, Any]:
+    """
+    Постоянные пожелания и контекст из Notes/general (Google Doc или текст).
+    Отсутствие файла — не ошибка (file_found=False).
+    """
+    return _fetch_notes_by_filename(_general_notes_filename())
+
+
+def fetch_medical_data() -> dict[str, Any]:
+    """
+    Медицинские данные и анализы из Notes/medical_data (Google Doc или текст).
+    Отсутствие файла — не ошибка (file_found=False).
+    """
+    return _fetch_notes_by_filename(_medical_notes_filename())
 
 
 def probe_notes_access(day: str | None = None) -> dict[str, Any]:
@@ -433,6 +476,34 @@ def probe_notes_access(day: str | None = None) -> dict[str, Any]:
         }
         if not fetch.get("ok"):
             result["ok"] = False
+
+    general = fetch_general_notes()
+    general_preview = (general.get("text") or "")[:200]
+    result["general_probe"] = {
+        "filename": general.get("filename"),
+        "file_found": general.get("file_found", False),
+        "char_count": general.get("char_count", 0),
+        "mime_type": general.get("mime_type"),
+        "preview": general_preview,
+        "ok": general.get("ok"),
+        "error": general.get("error"),
+    }
+    if not general.get("ok"):
+        result["ok"] = False
+
+    medical = fetch_medical_data()
+    medical_preview = (medical.get("text") or "")[:200]
+    result["medical_probe"] = {
+        "filename": medical.get("filename"),
+        "file_found": medical.get("file_found", False),
+        "char_count": medical.get("char_count", 0),
+        "mime_type": medical.get("mime_type"),
+        "preview": medical_preview,
+        "ok": medical.get("ok"),
+        "error": medical.get("error"),
+    }
+    if not medical.get("ok"):
+        result["ok"] = False
 
     return result
 
