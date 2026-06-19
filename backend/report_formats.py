@@ -288,6 +288,98 @@ _BOLD_TONE_RE = re.compile(
     re.I | re.S,
 )
 _BOLD_LABEL_RE = re.compile(r"^\*\*(.+?):\*\*\s*(.*)$", re.I | re.S)
+_PRIORITY_TAG_RE = re.compile(r"\[priority:\s*(high|medium|low)\]", re.I)
+_LEADING_TONE_TAG_RE = re.compile(r"^\[(good|warn|neutral|bad)\]\s*", re.I)
+
+
+def _strip_leading_tone_tags(text: str) -> tuple[str, str]:
+    tone = "neutral"
+    s = text.strip()
+    while True:
+        m = _LEADING_TONE_TAG_RE.match(s)
+        if not m:
+            break
+        tone = m.group(1).lower()
+        s = s[m.end() :].strip()
+    return tone, s
+
+
+def _recommendation_icon(priority: str | None, tone: str) -> str:
+    if priority == "high":
+        return "🔴" if tone in ("warn", "bad") else "❗"
+    if priority == "medium":
+        return "🟡"
+    if priority == "low":
+        return "🟢"
+    if tone == "bad":
+        return "🚨"
+    if tone == "warn":
+        return "⚠️"
+    if tone == "good":
+        return "✅"
+    return "💡"
+
+
+def _recommendation_border(priority: str | None, tone: str) -> str:
+    if priority == "high" or tone == "bad":
+        return "#ef4444"
+    if priority == "medium" or tone == "warn":
+        return "#f59e0b"
+    if priority == "low" or tone == "good":
+        return "#22c55e"
+    return "#94a3b8"
+
+
+def _parse_unified_recommendation(content: str) -> tuple[str | None, str, str | None, str]:
+    s = content.strip()
+    priority: str | None = None
+    pm = _PRIORITY_TAG_RE.search(s)
+    if pm:
+        priority = pm.group(1).lower()
+        s = _PRIORITY_TAG_RE.sub("", s).strip()
+    tone, s = _strip_leading_tone_tags(s)
+    parsed_tone, label, body = _parse_labeled_line(s, "neutral")
+    if parsed_tone != "neutral":
+        tone = parsed_tone
+    return priority, tone, label, body
+
+
+def _render_recommendation_line_html(content: str) -> str:
+    priority, tone, label, body = _parse_unified_recommendation(content)
+    icon = _recommendation_icon(priority, tone)
+    border = _recommendation_border(priority, tone)
+    if label:
+        text_html = (
+            f'<strong style="color:#111;">{html.escape(label)}</strong>'
+            + (f": {_inline_md(body)}" if body else "")
+        )
+    else:
+        fallback = body or content.strip()
+        text_html = _inline_md(fallback)
+    return (
+        f'<li style="display:flex;align-items:flex-start;gap:12px;margin:0 0 10px;'
+        f"padding:12px 14px;background:#fafafa;border-radius:8px;border-left:3px solid {border};"
+        f'list-style:none;">'
+        f'<span style="font-size:20px;line-height:1.35;flex-shrink:0;">{icon}</span>'
+        f'<div style="flex:1;color:#333;line-height:1.55;font-size:14px;">{text_html}</div>'
+        f"</li>"
+    )
+
+
+def _render_emoji_tagged_body(lines: list[str]) -> str:
+    """Список или абзац с [priority]/[tone] → карточки с эмодзи (рекомендации, фокус на завтра)."""
+    items: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        ul = re.match(r"^[\*\-]\s+(.*)$", line)
+        ol = re.match(r"^\d+\.\s+(.*)$", line)
+        payload = (ul or ol).group(1).strip() if (ul or ol) else line  # type: ignore[union-attr]
+        items.append(_render_recommendation_line_html(payload))
+    if not items:
+        return ""
+    return f'<ul style="margin:0;padding:0;">{"".join(items)}</ul>'
 
 
 def _inline_md(text: str) -> str:
@@ -310,7 +402,13 @@ def _line_tone_heuristic(text: str, section_slug: str) -> str:
     return "neutral"
 
 
-def _label_style(tone: str) -> str:
+def _plain_label_style() -> str:
+    return "color:#000;font-weight:bold;"
+
+
+def _label_style(tone: str, *, section_slug: str) -> str:
+    if section_slug == "executive_summary":
+        return _plain_label_style()
     if tone == "good":
         return "color:#166534;background:#ecfdf5;padding:2px 8px;border-radius:4px;font-weight:bold;"
     if tone == "warn":
@@ -341,23 +439,26 @@ def _parse_labeled_line(content: str, section_slug: str) -> tuple[str, str | Non
 def _render_line_html(content: str, section_slug: str, *, as_list_item: bool) -> str:
     tone, label, body = _parse_labeled_line(content, section_slug)
     tag = "li" if as_list_item else "p"
-    base = "margin:8px 0;padding:0;color:#333;line-height:1.55;list-style:none;"
+    text_color = "#000" if section_slug == "executive_summary" else "#333"
+    base = f"margin:8px 0;padding:0;color:{text_color};line-height:1.55;list-style:none;"
 
     if label is not None:
         label_html = (
-            f'<span style="{_label_style(tone)}">{html.escape(label)}</span>'
+            f'<span style="{_label_style(tone, section_slug=section_slug)}">{html.escape(label)}</span>'
         )
         body_html = _inline_md(body) if body else ""
         inner = f"{label_html}: {body_html}" if body_html else f"{label_html}:"
     else:
         inner = _inline_md(content)
-        if tone in ("good", "warn", "bad"):
-            inner = f'<span style="{_label_style(tone)}">{inner}</span>'
+        if tone in ("good", "warn", "bad") and section_slug != "executive_summary":
+            inner = f'<span style="{_label_style(tone, section_slug=section_slug)}">{inner}</span>'
 
     return f"<{tag} style=\"{base}\">{inner}</{tag}>"
 
 
-def _section_header_style(accent: str) -> str:
+def _section_header_style(accent: str, *, slug: str) -> str:
+    if slug == "executive_summary":
+        return "background:#fff;color:#000;border-bottom:1px solid #e3e5e8;"
     if accent == "warn":
         return "background:#fee2e2;color:#991b1b;border-bottom:1px solid #fecaca;"
     if accent == "good":
@@ -410,14 +511,22 @@ def _render_section(slug: str, body: str) -> str:
     elif slug == "tomorrow_focus":
         accent = "good"
 
-    body_html = _render_body_lines(body.split("\n"), slug)
-    border = "#fecaca" if accent == "warn" else "#bbf7d0" if accent == "good" else "#e3e5e8"
+    if slug in ("unified_recommendations", "tomorrow_focus"):
+        body_html = _render_emoji_tagged_body(body.split("\n"))
+    else:
+        body_html = _render_body_lines(body.split("\n"), slug)
+    if slug == "executive_summary":
+        border = "#e3e5e8"
+        header_style = _section_header_style(accent, slug=slug)
+    else:
+        border = "#fecaca" if accent == "warn" else "#bbf7d0" if accent == "good" else "#e3e5e8"
+        header_style = _section_header_style(accent, slug=slug)
     return f"""
 <div style="margin:0 0 14px;border:1px solid {border};border-radius:10px;overflow:hidden;">
-  <div style="padding:10px 14px;font-size:15px;font-weight:bold;{_section_header_style(accent)}">
+  <div style="padding:10px 14px;font-size:15px;font-weight:bold;{header_style}">
     {html.escape(title)}
   </div>
-  <div style="padding:12px 14px 14px;background:#fff;font-size:14px;line-height:1.55;">
+  <div style="padding:12px 14px 14px;background:#fff;font-size:14px;line-height:1.55;color:#000;">
     {body_html}
   </div>
 </div>"""
