@@ -304,6 +304,20 @@ def _strip_leading_tone_tags(text: str) -> tuple[str, str]:
     return tone, s
 
 
+_CIRCLE_ICONS = frozenset("🔴🟡🟢")
+
+
+def _recommendation_icon_html(icon: str) -> str:
+    if icon in _CIRCLE_ICONS:
+        size = "11px"
+    else:
+        size = "15px"
+    return (
+        f'<span style="font-size:{size};line-height:1;vertical-align:0.08em;'
+        f'margin-right:7px;display:inline-block;" aria-hidden="true">{icon}</span>'
+    )
+
+
 def _recommendation_icon(priority: str | None, tone: str) -> str:
     if priority == "high":
         return "🔴" if tone in ("warn", "bad") else "❗"
@@ -356,13 +370,14 @@ def _render_recommendation_line_html(content: str) -> str:
     else:
         fallback = body or content.strip()
         text_html = _inline_md(fallback)
+    icon_html = _recommendation_icon_html(icon)
     return (
-        f'<li style="display:flex;align-items:flex-start;gap:12px;margin:0 0 10px;'
+        f'<li style="margin:0 0 10px;'
         f"padding:12px 14px;background:#fafafa;border-radius:8px;border-left:3px solid {border};"
         f'list-style:none;">'
-        f'<span style="font-size:20px;line-height:1.35;flex-shrink:0;">{icon}</span>'
-        f'<div style="flex:1;color:#333;line-height:1.55;font-size:14px;">{text_html}</div>'
-        f"</li>"
+        f'<div style="color:#333;line-height:1.55;font-size:14px;">'
+        f"{icon_html}{text_html}"
+        f"</div></li>"
     )
 
 
@@ -415,25 +430,53 @@ def _label_style(tone: str, *, section_slug: str) -> str:
         return "color:#9a3412;background:#fff7ed;padding:2px 8px;border-radius:4px;font-weight:bold;"
     if tone == "bad":
         return "color:#991b1b;background:#fee2e2;padding:2px 8px;border-radius:4px;font-weight:bold;"
-    return "color:#374151;font-weight:bold;"
+    return "color:#374151;background:#f3f4f6;padding:2px 8px;border-radius:4px;font-weight:bold;"
 
 
 def _parse_labeled_line(content: str, section_slug: str) -> tuple[str, str | None, str]:
     """(tone, label_or_none, body) — явный тег Gemini или эвристика только для метки."""
-    for pat in (_TONE_IN_BOLD_RE, _BOLD_TONE_RE):
-        m = pat.match(content.strip())
-        if m:
-            return m.group(1).lower(), m.group(2).strip(), m.group(3).strip()
+    s = content.strip()
 
-    m = _BOLD_LABEL_RE.match(content.strip())
+    for pat in (_TONE_IN_BOLD_RE, _BOLD_TONE_RE):
+        m = pat.match(s)
+        if m:
+            tone = m.group(1).lower()
+            label = _LEADING_TONE_TAG_RE.sub("", m.group(2).strip()).strip()
+            return tone, label, _clean_line_body(m.group(3).strip())
+
+    m = _BOLD_LABEL_RE.match(s)
     if m:
-        label, body = m.group(1).strip(), m.group(2).strip()
+        label = _LEADING_TONE_TAG_RE.sub("", m.group(1).strip()).strip()
+        body = m.group(2).strip()
         tone = _line_tone_heuristic(f"{label} {body[:120]}", section_slug)
         if tone == "good" and _WARN_RE.search(body):
             tone = "warn"
-        return tone, label, body
+        return tone, label, _clean_line_body(body)
 
-    return _line_tone_heuristic(content, section_slug), None, content.strip()
+    leading_tone, rest = _strip_leading_tone_tags(s)
+    if ":" in rest:
+        label, _, body = rest.partition(":")
+        label = re.sub(r"^\*+|\*+$", "", label.strip()).strip()
+        label = _LEADING_TONE_TAG_RE.sub("", label).strip()
+        body = body.strip()
+        tone = leading_tone
+        if tone == "neutral":
+            tone = _line_tone_heuristic(f"{label} {body[:120]}", section_slug)
+        if label:
+            return tone, label, _clean_line_body(body)
+
+    return _line_tone_heuristic(s, section_slug), None, _clean_line_body(s)
+
+
+def _clean_line_body(body: str) -> str:
+    """Убирает теги [good/warn/bad/neutral] из текста после метки."""
+    if not body:
+        return body
+    _, body = _strip_leading_tone_tags(body.strip())
+    body = re.sub(r"\s*[—–-]\s*\[(good|warn|neutral|bad)\]\s*", " — ", body, flags=re.I)
+    body = re.sub(r"^\[(good|warn|neutral|bad)\]\s*", "", body, flags=re.I)
+    body = re.sub(r"\s*[—–-]\s*\[(good|warn|neutral|bad)\]\s*$", "", body, flags=re.I)
+    return re.sub(r"\s+\[(good|warn|neutral|bad)\]\s*$", "", body, flags=re.I).strip()
 
 
 def _render_line_html(content: str, section_slug: str, *, as_list_item: bool) -> str:
@@ -449,9 +492,7 @@ def _render_line_html(content: str, section_slug: str, *, as_list_item: bool) ->
         body_html = _inline_md(body) if body else ""
         inner = f"{label_html}: {body_html}" if body_html else f"{label_html}:"
     else:
-        inner = _inline_md(content)
-        if tone in ("good", "warn", "bad") and section_slug != "executive_summary":
-            inner = f'<span style="{_label_style(tone, section_slug=section_slug)}">{inner}</span>'
+        inner = _inline_md(body or content)
 
     return f"<{tag} style=\"{base}\">{inner}</{tag}>"
 
