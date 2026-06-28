@@ -163,6 +163,7 @@ API: <http://localhost:8000>
 - **GET /garmin/analyze?days=7** — анализ данных Garmin через **Gemini** (по умолчанию `gemini-2.5-flash`, можно `model=` или env `GEMINI_MODEL`).
 - **POST /internal/garmin-fetch?days=1** — то же для вызова по расписанию. Если задан **CRON_SECRET**, в запросе обязателен заголовок **`X-Cron-Secret`** с тем же значением.
 - **POST /internal/daily-report** — ежедневный отчёт: метрики Garmin за один день (по умолчанию сегодня; сон = прошедшая ночь), анализ через Gemini и **отправка письма** (таблица показателей + анализ) на `MAIL_TO`. Защищён `X-Cron-Secret`. Параметры: `day=YYYY-MM-DD` (необязательно), `model`, `send=false` (сформировать без отправки).
+- **POST /internal/weekly-report** — недельный мета-анализ по **сохранённым GCS-архивам** за `days` дней (по умолчанию 7, `end_day` = сегодня). Полные MD; при превышении `WEEKLY_MAX_INPUT_TOKENS` (220k) — FACT-digest. В письме — disclaimer при сокращении. Параметры: `end_day`, `days`, `model`, `send=false`. Рекомендуется cron **на 1 ч позже** daily-report.
 
 Для ежедневной выгрузки настройте **Cloud Scheduler**: HTTP-запрос на `https://YOUR_SERVICE_URL/internal/garmin-fetch?days=1` с заголовком `X-Cron-Secret: <CRON_SECRET>`.
 
@@ -205,35 +206,53 @@ API: <http://localhost:8000>
 
 **Права:** сервисному аккаунту Cloud Run — **Secret Manager Secret Accessor** на перечисленные секреты (включая новый `smtp-password`).
 
-### 3. Cloud Scheduler — запуск в 23:45 (Europe/Dublin)
+### 3. Cloud Scheduler — daily и weekly (Europe/Dublin)
 
-Запуск **за 15 минут до полуночи**, чтобы при retry/fallback Gemini (паузы между вызовами, смена модели) отчёт успел завершиться до 00:00 и остался привязан к текущему календарному дню.
+**Daily:** запуск утром (например **09:00**), чтобы отчёт формировался после пробуждения за вчера + сон прошедшей ночи.
 
-После деплоя сервиса (URL вида `https://mybody-xxxx.europe-west1.run.app`) создайте задание (подставьте URL и значение `CRON_SECRET` из GitHub):
+**Weekly:** **на 1 час позже daily** (например **10:00 по воскресеньям**), чтобы daily успел записать архив за последний день периода.
+
+После деплоя сервиса (URL вида `https://mybody-xxxx.europe-west1.run.app`) создайте задания (подставьте URL и значение `CRON_SECRET` из GitHub):
 
 ```bash
+# Ежедневный отчёт — 09:00 каждый день
 gcloud scheduler jobs create http mybody-daily-report \
   --project=mybody-dev-env \
   --location=europe-west1 \
-  --schedule="45 23 * * *" \
+  --schedule="0 9 * * *" \
   --time-zone="Europe/Dublin" \
   --uri="https://YOUR_SERVICE_URL/internal/daily-report" \
   --http-method=POST \
   --headers="X-Cron-Secret=ЗНАЧЕНИЕ_CRON_SECRET" \
-  --attempt-deadline=300s
+  --attempt-deadline=540s
+
+# Недельный отчёт — воскресенье 10:00 (через час после daily)
+gcloud scheduler jobs create http mybody-weekly-report \
+  --project=mybody-dev-env \
+  --location=europe-west1 \
+  --schedule="0 10 * * 0" \
+  --time-zone="Europe/Dublin" \
+  --uri="https://YOUR_SERVICE_URL/internal/weekly-report?days=7" \
+  --http-method=POST \
+  --headers="X-Cron-Secret=ЗНАЧЕНИЕ_CRON_SECRET" \
+  --attempt-deadline=540s
 ```
 
 Проверить вручную (без ожидания расписания):
 
 ```bash
 gcloud scheduler jobs run mybody-daily-report --location=europe-west1 --project=mybody-dev-env
+gcloud scheduler jobs run mybody-weekly-report --location=europe-west1 --project=mybody-dev-env
 ```
 
 Или напрямую (например, без отправки письма — только проверить сбор и анализ):
 
 ```bash
 curl -X POST "https://YOUR_SERVICE_URL/internal/daily-report?send=false" -H "X-Cron-Secret: ЗНАЧЕНИЕ"
+curl -X POST "https://YOUR_SERVICE_URL/internal/weekly-report?send=false&days=7" -H "X-Cron-Secret: ЗНАЧЕНИЕ"
 ```
+
+**GCS outcomes:** daily → `outcomes/vb-YYYYMMDD-HHMM.html`; weekly → `outcomes/weekly-vb-YYYYMMDD-HHMM.html`.
 
 ### Переменные окружения email-отчёта
 
@@ -246,6 +265,8 @@ curl -X POST "https://YOUR_SERVICE_URL/internal/daily-report?send=false" -H "X-C
 | `SMTP_HOST` / `SMTP_PORT` | env при деплое | По умолчанию `smtp.gmail.com:587` |
 | `MAIL_TO` / `SMTP_USER` | (опц.) | Если не заданы — используется `GARMIN_EMAIL` |
 | `GEMINI_INTER_CALL_DELAY_SEC` | env при деплое (65) | Пауза между кратким и подробным вызовом Gemini (сек), чтобы не упираться в TPM/мин |
+| `GEMINI_MODEL_WEEKLY` | env (опц.) | Модель для `/internal/weekly-report`; по умолчанию `GEMINI_MODEL_COMBINED` → `GEMINI_MODEL` |
+| `WEEKLY_MAX_INPUT_TOKENS` | env (опц., 220000) | Бюджет входа для weekly; при превышении — FACT-digest |
 
 ### Google Drive — сохранение отчётов
 

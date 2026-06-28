@@ -359,6 +359,86 @@ def _collect_metrics_range(api: Any, start: Any, end: Any) -> dict[str, Any]:
     }
 
 
+def _call_daily_metric(api: Any, method_name: str, day_str: str) -> Any:
+    method = getattr(api, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        if method_name in ("get_body_composition", "get_body_battery"):
+            return method(day_str, day_str)
+        return method(day_str)
+    except Exception:
+        return None
+
+
+def _collect_global_metrics(api: Any) -> dict[str, Any]:
+    global_metrics: dict[str, Any] = {}
+    for method_name in _GLOBAL_METRIC_METHODS:
+        method = getattr(api, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            if method_name == "get_goals":
+                result = method("active", 0, 30)
+            else:
+                result = method()
+            if result is not None:
+                key = method_name.replace("get_", "", 1)
+                global_metrics[key] = result
+        except Exception:
+            pass
+    try:
+        lt = getattr(api, "get_lactate_threshold", None)
+        if callable(lt):
+            result = lt(latest=True)
+            if result is not None:
+                global_metrics["lactate_threshold"] = result
+    except Exception:
+        pass
+    return global_metrics
+
+
+def _collect_morning_report_range(api: Any, activity_day: Any, sleep_day: Any) -> dict[str, Any]:
+    """
+    Утренний отчёт: полные дневные метрики за activity_day (D−1), без sleep_data;
+    за sleep_day (D) — только sleep_data (ночь → пробуждение).
+    Без range_metrics — меньше объём для Gemini.
+    """
+    activity_str = activity_day.isoformat()
+    sleep_str = sleep_day.isoformat()
+
+    metrics_by_day: dict[str, dict[str, Any]] = {activity_str: {}, sleep_str: {}}
+    for method_name in _DAILY_METRIC_METHODS:
+        if method_name == "get_sleep_data":
+            continue
+        result = _call_daily_metric(api, method_name, activity_str)
+        if result is not None:
+            metrics_by_day[activity_str][method_name.replace("get_", "", 1)] = result
+
+    sleep_result = _call_daily_metric(api, "get_sleep_data", sleep_str)
+    if sleep_result is not None:
+        metrics_by_day[sleep_str]["sleep_data"] = sleep_result
+
+    activity_list: list[dict[str, Any]] = []
+    try:
+        activities = api.get_activities_by_date(startdate=activity_str, enddate=activity_str)
+        if isinstance(activities, list):
+            for a in activities:
+                activity_list.append(dict(a))
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "from": activity_str,
+        "to": sleep_str,
+        "activities": activity_list,
+        "metrics_by_day": metrics_by_day,
+        "range_metrics": {},
+        "global_metrics": _collect_global_metrics(api),
+    }
+
+
 def fetch_all_metrics(days: int = 7) -> dict[str, Any]:
     """
     Загружает все доступные метрики Garmin за последние days дней.
@@ -419,14 +499,129 @@ def fetch_daily_metrics(day: str | None = None) -> dict[str, Any]:
         else:
             report_day = _default_report_day()
         activity_day = report_day - timedelta(days=1)
-        payload = _collect_metrics_range(api, activity_day, report_day)
+        payload = _collect_morning_report_range(api, activity_day, report_day)
         payload["report_day"] = report_day.isoformat()
         payload["activity_day"] = activity_day.isoformat()
         payload["food_day"] = activity_day.isoformat()
         payload["sleep_day"] = report_day.isoformat()
+        payload["report_context"] = {
+            "report_day": report_day.isoformat(),
+            "activity_day": activity_day.isoformat(),
+            "sleep_day": report_day.isoformat(),
+            "food_day": activity_day.isoformat(),
+            "note": (
+                "Утренний отчёт: активность за activity_day; сон прошедшей ночи — "
+                "только sleep_report / sleep_data за sleep_day (дата пробуждения)."
+            ),
+        }
+        payload["sleep_report"] = extract_sleep_report(payload)
+        payload["metrics_by_day"] = _morning_report_metrics_by_day(payload)
         return payload
     except Exception as e:
         return {"ok": False, "error": str(e), "metrics_by_day": None}
+
+
+def _sec_to_min(seconds: Any) -> int | None:
+    if seconds is None:
+        return None
+    try:
+        return int(round(int(seconds) / 60))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sleep_score_value(scores: Any, key: str) -> Any:
+    if not isinstance(scores, dict):
+        return None
+    item = scores.get(key)
+    if isinstance(item, dict):
+        return item.get("value") if item.get("value") is not None else item.get("qualifierKey")
+    return item
+
+
+def _ts_label(ts: Any) -> str | None:
+    if ts is None:
+        return None
+    try:
+        ms = int(ts)
+        if ms > 10_000_000_000:
+            ms //= 1000
+        return datetime.fromtimestamp(ms).strftime("%H:%M")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def extract_sleep_report(metrics: dict[str, Any]) -> dict[str, Any]:
+    """
+    Структурированные метрики одной ночи (sleep_data на sleep_day = дата пробуждения).
+    Источник для промптов и трендов в архиве.
+    """
+    sleep_day = str(metrics.get("sleep_day") or metrics.get("report_day") or "")
+    out: dict[str, Any] = {"ok": True, "found": False, "sleep_day": sleep_day}
+    if not sleep_day:
+        return out
+
+    by_day = metrics.get("metrics_by_day") or {}
+    day = by_day.get(sleep_day) or {}
+    sleep_data = day.get("sleep_data")
+    if not isinstance(sleep_data, dict):
+        return out
+
+    dto = sleep_data.get("dailySleepDTO") or sleep_data
+    if not isinstance(dto, dict):
+        return out
+
+    scores = dto.get("sleepScores") or {}
+    total_min = _sec_to_min(dto.get("sleepTimeSeconds"))
+    out.update(
+        {
+            "found": True,
+            "night_label": f"ночь → {sleep_day}",
+            "total_sleep_min": total_min,
+            "total_sleep_hm": _seconds_to_hours_min(dto.get("sleepTimeSeconds")),
+            "deep_sleep_min": _sec_to_min(dto.get("deepSleepSeconds")),
+            "light_sleep_min": _sec_to_min(dto.get("lightSleepSeconds")),
+            "rem_sleep_min": _sec_to_min(dto.get("remSleepSeconds")),
+            "awake_min": _sec_to_min(dto.get("awakeSleepSeconds")),
+            "restless_moments": dto.get("restlessMomentCount"),
+            "avg_sleep_stress": dto.get("avgSleepStress"),
+            "avg_hr_sleep": dto.get("avgHeartRate") or dto.get("averageSleepHeartRate"),
+            "min_hr_sleep": dto.get("lowestHeartRate") or dto.get("lowestHeartRateDuringSleep"),
+            "max_hr_sleep": dto.get("highestHeartRate") or dto.get("maxHeartRate"),
+            "avg_respiration": dto.get("averageRespiration") or dto.get("avgRespirationValue"),
+            "avg_spo2": dto.get("averageSpO2") or dto.get("averageSpO2Value"),
+            "lowest_spo2": dto.get("lowestSpO2") or dto.get("lowestSpO2Value"),
+            "sleep_score_overall": _sleep_score_value(scores, "overall"),
+            "sleep_score_quality": _sleep_score_value(scores, "quality"),
+            "sleep_score_recovery": _sleep_score_value(scores, "recovery"),
+            "sleep_score_duration": _sleep_score_value(scores, "duration"),
+            "sleep_score_stress": _sleep_score_value(scores, "stress"),
+            "sleep_quality_type": dto.get("sleepQualityType") or dto.get("sleepQuality"),
+            "sleep_feedback": dto.get("sleepFeedback") or dto.get("sleepScoreFeedback"),
+            "validation": dto.get("validation") or dto.get("sleepValidation"),
+            "bedtime": _ts_label(dto.get("sleepStartTimestampLocal") or dto.get("sleepStartTimestampGMT")),
+            "wake_time": _ts_label(dto.get("sleepEndTimestampLocal") or dto.get("sleepEndTimestampGMT")),
+        }
+    )
+    return out
+
+
+def _morning_report_metrics_by_day(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Для Gemini: активность за D−1 без sleep_data; сон только на sleep_day."""
+    by_day = dict(metrics.get("metrics_by_day") or {})
+    activity_day = str(metrics.get("activity_day") or "")
+    sleep_day = str(metrics.get("sleep_day") or "")
+    filtered: dict[str, Any] = {}
+    if activity_day and activity_day in by_day:
+        day = dict(by_day[activity_day])
+        day.pop("sleep_data", None)
+        filtered[activity_day] = day
+    if sleep_day and sleep_day in by_day:
+        day = by_day[sleep_day]
+        sleep_data = day.get("sleep_data") if isinstance(day, dict) else None
+        if sleep_data is not None:
+            filtered[sleep_day] = {"sleep_data": sleep_data}
+    return filtered
 
 
 def _seconds_to_hours_min(seconds: int | float | None) -> str:
@@ -489,11 +684,13 @@ def build_readable_summary(raw: dict[str, Any]) -> dict[str, Any]:
 
 def summary_from_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     """
-    Строит удобочитаемую сводку по дням из результата fetch_all_metrics / fetch_daily_metrics
-    (переиспользует build_readable_summary). Удобно для таблицы в email-отчёте.
+    Сводка для email: для утреннего отчёта — активность за D−1 и сон одной ночи (sleep_day).
     """
     if not metrics.get("ok"):
         return {"ok": False, "error": metrics.get("error"), "days": []}
+    if metrics.get("report_day"):
+        return build_morning_report_summary(metrics)
+
     by_day = metrics.get("metrics_by_day") or {}
     stats_by_day: dict[str, Any] = {}
     sleep_duration_by_day: dict[str, int] = {}
@@ -516,3 +713,36 @@ def summary_from_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "sleep_duration_by_day": sleep_duration_by_day,
     }
     return build_readable_summary(raw)
+
+
+def build_morning_report_summary(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Email-таблица: одна строка активности (D−1) + блок сна одной ночи (sleep_day)."""
+    activity_day = str(metrics.get("activity_day") or "")
+    sleep_report = metrics.get("sleep_report") or extract_sleep_report(metrics)
+    by_day = metrics.get("metrics_by_day") or {}
+
+    activity_row: dict[str, Any] = {"date": activity_day, "label": f"Активность ({activity_day})"}
+    if activity_day and activity_day in by_day:
+        stats = (by_day[activity_day] or {}).get("stats")
+        if isinstance(stats, dict):
+            partial = build_readable_summary(
+                {
+                    "ok": True,
+                    "stats_by_day": {activity_day: stats},
+                    "sleep_duration_by_day": {},
+                    "activities": [],
+                }
+            )
+            days = partial.get("days") or []
+            if days:
+                activity_row = {**days[0], "label": f"Активность ({activity_day})", "sleep": "—"}
+
+    return {
+        "ok": True,
+        "mode": "morning_report",
+        "activity_day": activity_day,
+        "sleep_day": sleep_report.get("sleep_day"),
+        "activity": activity_row,
+        "sleep": sleep_report,
+        "days": [activity_row],
+    }

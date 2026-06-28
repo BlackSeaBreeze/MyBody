@@ -149,6 +149,11 @@ def extract_analysis_section(md: str) -> str:
 
 def extract_food_frontmatter(md: str) -> dict[str, Any]:
     """JSON из блока метаданных food-отчёта; пустой dict если не найден."""
+    return extract_archive_frontmatter(md)
+
+
+def extract_archive_frontmatter(md: str) -> dict[str, Any]:
+    """JSON из первого ```json блока в архивном Markdown."""
     m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", md)
     if not m:
         return {}
@@ -157,6 +162,249 @@ def extract_food_frontmatter(md: str) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+
+def extract_markdown_section(md: str, heading: str) -> str:
+    """Текст секции ## heading до следующей ## или конца документа."""
+    pattern = rf"^##\s+{re.escape(heading)}\s*$([\s\S]*?)(?=^##\s+|\Z)"
+    m = re.search(pattern, md, flags=re.I | re.M)
+    return m.group(1).strip() if m else ""
+
+
+def extract_fact_lines(text: str) -> list[str]:
+    """Строки FACT | … из секции facts_for_aggregation или всего текста."""
+    facts: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^-\s*FACT\s*\|", s, flags=re.I):
+            facts.append(re.sub(r"^-\s*", "", s))
+        elif s.startswith("FACT |"):
+            facts.append(s)
+    return facts
+
+
+_CHARS_PER_TOKEN_EST = 1.35
+
+
+def estimate_token_count(text: str) -> int:
+    """Оценка числа токенов (эмпирика Garmin/JSON ~1.35 символа/токен)."""
+    if not text:
+        return 0
+    return int(len(text) / _CHARS_PER_TOKEN_EST)
+
+
+def _weekly_input_token_budget() -> int:
+    try:
+        return max(10_000, int(os.environ.get("WEEKLY_MAX_INPUT_TOKENS", "220000")))
+    except ValueError:
+        return 220_000
+
+
+def weekly_file_stem(*, end_day_label: str, timezone: str | None = None) -> str:
+    """Имя weekly-отчёта: weekly-vb-YYYYMMDD-hhmm."""
+    tz_name = (timezone or os.environ.get("REPORT_TIMEZONE", "Europe/Dublin")).strip() or "Europe/Dublin"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Europe/Dublin")
+    now = datetime.now(tz)
+    date_part = end_day_label.strip().replace("-", "")
+    return f"weekly-vb-{date_part}-{now.strftime('%H%M')}"
+
+
+def build_weekly_full_context(
+    *,
+    garmin_archives: list[dict[str, Any]],
+    food_archives: list[dict[str, Any]],
+) -> str:
+    """Склеивает полные сохранённые MD-архивы за период (Garmin + food по дням)."""
+    food_by_day = {str(a.get("day")): a for a in food_archives if a.get("day")}
+    parts: list[str] = []
+
+    for arch in sorted(garmin_archives, key=lambda a: str(a.get("day") or "")):
+        day = str(arch.get("day") or "?")
+        obj = arch.get("object") or ""
+        parts.append(
+            f"=== {day} — экспертный архив Garmin ({obj}) ===\n"
+            f"{(arch.get('content') or '').strip()}"
+        )
+        food = food_by_day.get(day)
+        if food and food.get("content"):
+            parts.append(
+                f"=== {day} — архив питания ({food.get('object') or ''}) ===\n"
+                f"{food['content'].strip()}"
+            )
+
+    return "\n\n".join(parts)
+
+
+def build_weekly_fact_digest(
+    *,
+    garmin_archives: list[dict[str, Any]],
+    food_archives: list[dict[str, Any]],
+) -> str:
+    """
+    Сценарий 1 (FACT-digest): key_metrics + sleep_metrics + FACT-строки по каждому дню.
+    """
+    food_by_day = {str(a.get("day")): a for a in food_archives if a.get("day")}
+    days_payload: list[dict[str, Any]] = []
+
+    for arch in sorted(garmin_archives, key=lambda a: str(a.get("day") or "")):
+        day = str(arch.get("day") or "?")
+        content = arch.get("content") or ""
+        fm = extract_archive_frontmatter(content)
+        analysis = extract_analysis_section(content)
+        day_entry: dict[str, Any] = {
+            "date": fm.get("date") or day,
+            "garmin_object": arch.get("object"),
+            "key_metrics": fm.get("key_metrics") or {},
+            "sleep_metrics": extract_markdown_section(analysis, "sleep_metrics"),
+            "facts": extract_fact_lines(analysis),
+        }
+        food = food_by_day.get(day)
+        if food and food.get("content"):
+            food_content = food["content"]
+            food_fm = extract_archive_frontmatter(food_content)
+            food_analysis = extract_analysis_section(food_content)
+            day_entry["food"] = {
+                "object": food.get("object"),
+                "meta": {
+                    k: food_fm.get(k)
+                    for k in (
+                        "photos_analyzed",
+                        "analysis_complete",
+                        "photos_found_in_folder",
+                    )
+                    if k in food_fm
+                },
+                "daily_totals": extract_markdown_section(food_analysis, "daily_totals"),
+                "facts": extract_fact_lines(food_analysis),
+            }
+        days_payload.append(day_entry)
+
+    payload = {
+        "document_type": "mybody-weekly-fact-digest",
+        "purpose": "gemini_weekly_input_reduced",
+        "days_count": len(days_payload),
+        "days": days_payload,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def prepare_weekly_gemini_context(
+    *,
+    garmin_archives: list[dict[str, Any]],
+    food_archives: list[dict[str, Any]],
+    max_input_tokens: int | None = None,
+) -> dict[str, Any]:
+    """
+    Полные архивы, если влезают в бюджет; иначе FACT-digest (сценарий 1).
+    """
+    budget = max_input_tokens if max_input_tokens is not None else _weekly_input_token_budget()
+    full_text = build_weekly_full_context(
+        garmin_archives=garmin_archives,
+        food_archives=food_archives,
+    )
+    est_full = estimate_token_count(full_text)
+    if est_full <= budget:
+        return {
+            "text": full_text,
+            "context_mode": "full",
+            "est_tokens": est_full,
+            "est_tokens_full": est_full,
+            "free_tier_fallback": False,
+            "input_token_budget": budget,
+        }
+
+    digest_text = build_weekly_fact_digest(
+        garmin_archives=garmin_archives,
+        food_archives=food_archives,
+    )
+    est_digest = estimate_token_count(digest_text)
+    return {
+        "text": digest_text,
+        "context_mode": "fact_digest",
+        "est_tokens": est_digest,
+        "est_tokens_full": est_full,
+        "free_tier_fallback": True,
+        "input_token_budget": budget,
+    }
+
+
+def weekly_context_disclaimer_html(ctx: dict[str, Any]) -> str:
+    """Баннер в письме, если контекст был сокращён перед Gemini."""
+    if not ctx.get("free_tier_fallback"):
+        return ""
+    est_full = ctx.get("est_tokens_full")
+    est_used = ctx.get("est_tokens")
+    budget = ctx.get("input_token_budget")
+    full_s = f"{est_full:,}".replace(",", " ") if est_full is not None else "?"
+    used_s = f"{est_used:,}".replace(",", " ") if est_used is not None else "?"
+    budget_s = f"{budget:,}".replace(",", " ") if budget is not None else "220 000"
+    return (
+        '<div style="background:#fff8e6;border:1px solid #f0c040;padding:12px 14px;'
+        'margin:0 0 18px;border-radius:6px;font-size:14px;color:#5c4a00;">'
+        "<strong>⚠ Контекст для Gemini был сокращён.</strong> "
+        f"Полные архивы за период (~{full_s} токенов) превысили лимит входа "
+        f"({budget_s} токенов, free tier). В модель переданы агрегированные метрики "
+        f"(FACT-digest, ~{used_s} токенов). "
+        "Полные отчёты сохранены в GCS без изменений."
+        "</div>"
+    )
+
+
+def build_weekly_email_html(
+    *,
+    period_label: str,
+    analysis_result: dict[str, Any],
+    model: str,
+    context_prep: dict[str, Any],
+    archives_meta: dict[str, Any],
+) -> str:
+    """HTML недельного отчёта для email и outcomes."""
+    ctx_mode = context_prep.get("context_mode") or "full"
+    meta_bits = [
+        f"период: {html.escape(period_label)}",
+        f"модель: {html.escape(model)}",
+        f"архивов Garmin: {archives_meta.get('garmin_days_found', '?')}",
+        f"контекст: {'полный' if ctx_mode == 'full' else 'FACT-digest'}",
+    ]
+    if context_prep.get("est_tokens") is not None:
+        meta_bits.append(f"~{context_prep['est_tokens']:,} токенов входа".replace(",", " "))
+    meta = " · ".join(meta_bits)
+
+    disclaimer = weekly_context_disclaimer_html(context_prep)
+
+    if analysis_result.get("ok") and analysis_result.get("analysis"):
+        analysis_html = markdown_to_email_html(analysis_result["analysis"])
+    else:
+        err = html.escape(str(analysis_result.get("error", "unknown")))
+        analysis_html = f'<p style="color:#a33;">Анализ недоступен: {err}</p>'
+
+    missing = archives_meta.get("missing") or []
+    missing_garmin = [m for m in missing if m.get("kind") == "garmin"]
+    missing_note = ""
+    if missing_garmin:
+        days_str = ", ".join(html.escape(str(m.get("day", "?"))) for m in missing_garmin)
+        missing_note = (
+            f'<p style="color:#888;font-size:13px;">Нет Garmin-архива за: {days_str}.</p>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;background:#f5f6f8;">
+  <div style="max-width:680px;margin:0 auto;padding:24px 20px;font-family:Arial,Helvetica,sans-serif;color:#222;line-height:1.55;">
+    <h1 style="font-size:22px;margin:0 0 4px;color:#111;">MyBody — недельный отчёт</h1>
+    <div style="color:#888;font-size:13px;margin-bottom:16px;">{meta}</div>
+    {disclaimer}
+    {missing_note}
+    <h2 style="font-size:16px;margin:18px 0 10px;color:#374151;">Итоги недели и рекомендации</h2>
+    {analysis_html}
+    <div style="color:#aaa;font-size:12px;margin-top:20px;">Сформировано автоматически сервисом MyBody.</div>
+  </div>
+</body>
+</html>"""
 
 
 _BJU_LINE_RE = re.compile(

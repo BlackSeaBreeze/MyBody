@@ -12,6 +12,8 @@ SA нужна роль roles/storage.objectAdmin на bucket (см. scripts/setu
 from __future__ import annotations
 
 import os
+import re
+from datetime import date, timedelta
 from typing import Any
 
 try:
@@ -122,6 +124,115 @@ def download_text(*, object_name: str) -> dict[str, Any]:
             "object": object_name,
             "bucket": bucket_name,
         }
+
+
+def get_latest_garmin_archive_for_day(day_label: str) -> dict[str, Any]:
+    """
+    Последний архивный Garmin-отчёт за календарный день (YYYY-MM-DD).
+    Имена: archive/vb-YYYYMMDD-HHMM.md (без -food.md); при нескольких — max HHMM.
+    """
+    bucket_name = _bucket_name()
+    if storage is None:
+        return {"ok": False, "error": "gcs_sdk_not_installed"}
+    if not bucket_name:
+        return {"ok": False, "error": "gcs_bucket_not_configured"}
+
+    day_compact = day_label.strip().replace("-", "")
+    if len(day_compact) != 8 or not day_compact.isdigit():
+        return {"ok": False, "error": "invalid_day_label", "day": day_label}
+
+    list_prefix = f"{_prefix('archive')}vb-{day_compact}-"
+    try:
+        bucket = _client().bucket(bucket_name)
+        candidates = [
+            b.name
+            for b in bucket.list_blobs(prefix=list_prefix)
+            if b.name.endswith(".md") and not b.name.endswith("-food.md")
+        ]
+        if not candidates:
+            return {"ok": False, "error": "no_garmin_archive_for_day", "day": day_label}
+
+        latest_object = max(candidates)
+        downloaded = download_text(object_name=latest_object)
+        if not downloaded.get("ok"):
+            return downloaded
+        return {
+            "ok": True,
+            "day": day_label,
+            "object": latest_object,
+            "gs_uri": downloaded.get("gs_uri"),
+            "content": downloaded["content"],
+            "candidates_count": len(candidates),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "gcs_list_failed",
+            "detail": str(e),
+            "day": day_label,
+            "bucket": bucket_name,
+        }
+
+
+def fetch_weekly_archives(*, end_day: str, days: int = 7) -> dict[str, Any]:
+    """
+    Загружает последние archives за days календарных дней, заканчивая end_day (включительно).
+    Garmin — обязателен хотя бы один день; food — опционально по дням.
+    """
+    bucket_name = _bucket_name()
+    if storage is None:
+        return {"ok": False, "error": "gcs_sdk_not_installed"}
+    if not bucket_name:
+        return {"ok": False, "error": "gcs_bucket_not_configured"}
+
+    days = min(max(1, days), 31)
+    try:
+        end = date.fromisoformat(end_day.strip())
+    except ValueError:
+        return {"ok": False, "error": "invalid_end_day", "end_day": end_day}
+
+    start = end - timedelta(days=days - 1)
+    day_labels = [(start + timedelta(days=i)).isoformat() for i in range(days)]
+
+    garmin_archives: list[dict[str, Any]] = []
+    food_archives: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+
+    for day_label in day_labels:
+        garmin = get_latest_garmin_archive_for_day(day_label)
+        if garmin.get("ok"):
+            garmin_archives.append(garmin)
+        else:
+            missing.append({"day": day_label, "kind": "garmin", "error": garmin.get("error")})
+
+        food = get_latest_food_analysis_for_day(day_label)
+        if food.get("ok"):
+            food_archives.append(food)
+        else:
+            missing.append({"day": day_label, "kind": "food", "error": food.get("error")})
+
+    if not garmin_archives:
+        return {
+            "ok": False,
+            "error": "no_garmin_archives_in_range",
+            "end_day": end_day,
+            "days": days,
+            "day_labels": day_labels,
+            "missing": missing,
+        }
+
+    return {
+        "ok": True,
+        "end_day": end_day,
+        "start_day": day_labels[0],
+        "days": days,
+        "day_labels": day_labels,
+        "garmin_archives": garmin_archives,
+        "food_archives": food_archives,
+        "garmin_days_found": len(garmin_archives),
+        "food_days_found": len(food_archives),
+        "missing": missing,
+    }
 
 
 def get_latest_food_analysis_for_day(day_label: str) -> dict[str, Any]:

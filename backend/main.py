@@ -324,6 +324,9 @@ def _analyze_html(result: dict, *, days: int, model: str) -> str:
 
 def _summary_table_html(summary: dict) -> str:
     """Компактная таблица показателей за день для письма (inline-стили — для почтовых клиентов)."""
+    if summary.get("mode") == "morning_report":
+        return _morning_report_table_html(summary)
+
     days = summary.get("days") or []
     if not days:
         return '<p style="color:#a33;">Нет данных для таблицы.</p>'
@@ -353,6 +356,67 @@ def _summary_table_html(summary: dict) -> str:
         f"<th {th}>Расстояние</th><th {th}>Стресс</th><th {th}>Body Battery</th><th {th}>Пульс покоя</th>"
         f"</tr></thead><tbody>{rows}</tbody></table>"
     )
+
+
+def _morning_report_table_html(summary: dict) -> str:
+    """Утренний отчёт: активность за вчера + сон одной ночи (без путаницы двух дат)."""
+    th = 'style="border:1px solid #ddd;padding:6px 10px;text-align:left;background:#f3f4f6;font-size:13px;"'
+    td = 'style="border:1px solid #ddd;padding:6px 10px;text-align:left;font-size:13px;"'
+    activity = summary.get("activity") or {}
+    sleep = summary.get("sleep") or {}
+    activity_day = summary.get("activity_day") or activity.get("date") or "—"
+    sleep_day = summary.get("sleep_day") or sleep.get("sleep_day") or "—"
+
+    act_row = (
+        "<tr>"
+        f'<td {td}><strong>Активность ({html.escape(str(activity_day))})</strong></td>'
+        f'<td {td}>{html.escape(str(activity.get("steps") or "—"))}</td>'
+        f'<td {td}>—</td>'
+        f'<td {td}>{activity.get("calories_total") if activity.get("calories_total") is not None else "—"}</td>'
+        f'<td {td}>{(str(activity.get("distance_km")) + " км") if activity.get("distance_km") is not None else "—"}</td>'
+        f'<td {td}>{html.escape(str(activity.get("stress") or "—"))}</td>'
+        f'<td {td}>{html.escape(str(activity.get("body_battery") or "—"))}</td>'
+        f'<td {td}>{activity.get("resting_hr") if activity.get("resting_hr") is not None else "—"}</td>'
+        "</tr>"
+    )
+    activity_table = (
+        '<table style="border-collapse:collapse;width:100%;margin:8px 0 12px;">'
+        "<thead><tr>"
+        f"<th {th}>Период</th><th {th}>Шаги / цель</th><th {th}>Сон</th><th {th}>Ккал</th>"
+        f"<th {th}>Расстояние</th><th {th}>Стресс</th><th {th}>Body Battery</th><th {th}>Пульс покоя</th>"
+        f"</tr></thead><tbody>{act_row}</tbody></table>"
+    )
+
+    if not sleep.get("found"):
+        return activity_table + '<p style="color:#888;font-size:13px;">Сон: нет данных за эту ночь.</p>'
+
+    def _cell(label: str, val: Any) -> str:
+        display = "—" if val is None or val == "" else html.escape(str(val))
+        return f"<tr><td {td}><strong>{html.escape(label)}</strong></td><td {td}>{display}</td></tr>"
+
+    sleep_rows = "".join(
+        [
+            _cell("Ночь (пробуждение)", sleep_day),
+            _cell("Всего сна", sleep.get("total_sleep_hm") or sleep.get("total_sleep_min")),
+            _cell("Глубокий сон", f'{sleep.get("deep_sleep_min")} мин' if sleep.get("deep_sleep_min") is not None else None),
+            _cell("Лёгкий сон", f'{sleep.get("light_sleep_min")} мин' if sleep.get("light_sleep_min") is not None else None),
+            _cell("REM", f'{sleep.get("rem_sleep_min")} мин' if sleep.get("rem_sleep_min") is not None else None),
+            _cell("Бодрствование", f'{sleep.get("awake_min")} мин' if sleep.get("awake_min") is not None else None),
+            _cell("Пробуждения", sleep.get("restless_moments")),
+            _cell("Оценка сна", sleep.get("sleep_score_overall")),
+            _cell("Качество", sleep.get("sleep_quality_type") or sleep.get("sleep_score_quality")),
+            _cell("Отбой → подъём", f'{sleep.get("bedtime") or "?"} → {sleep.get("wake_time") or "?"}'),
+            _cell("Пульс во сне (ср.)", sleep.get("avg_hr_sleep")),
+            _cell("Стресс во сне (ср.)", sleep.get("avg_sleep_stress")),
+        ]
+    )
+    sleep_table = (
+        f'<p style="font-size:14px;font-weight:bold;margin:12px 0 6px;color:#374151;">'
+        f"Сон (ночь → {html.escape(str(sleep_day))})</p>"
+        f'<table style="border-collapse:collapse;width:100%;margin:0 0 16px;">'
+        f"<tbody>{sleep_rows}</tbody></table>"
+    )
+    return activity_table + sleep_table
 
 
 def _gemini_sleep() -> int:
@@ -919,6 +983,146 @@ def daily_report(
     if result.get("gemini_daily_quota"):
         result["ok"] = False
         result.setdefault("partial", True)
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/internal/weekly-report")
+def weekly_report(
+    end_day: str | None = None,
+    days: int = 7,
+    model: str | None = None,
+    send: bool = True,
+    save_reports: bool = True,
+    x_cron_secret: str | None = Header(None, alias="X-Cron-Secret"),
+):
+    """
+    Недельный мета-анализ по сохранённым GCS-архивам (Garmin + food за days дней).
+
+    По умолчанию end_day — сегодня в REPORT_TIMEZONE; days=7.
+    Контекст: полные MD; при превышении WEEKLY_MAX_INPUT_TOKENS (220k) — FACT-digest.
+    В письме — disclaimer, если контекст был сокращён.
+
+    Рекомендуемый cron: на 1 ч позже daily-report (например вс 10:00 Europe/Dublin).
+    """
+    secret = os.environ.get("CRON_SECRET", "").strip()
+    if secret and x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Cron-Secret")
+
+    end_day_label = end_day.strip() if end_day else str(garmin_client._default_report_day())
+    days_count = min(max(1, days), 31)
+    gemini_override = model.strip() if model else None
+    file_stem = report_formats.weekly_file_stem(end_day_label=end_day_label)
+    period_label = f"{end_day_label} (−{days_count} дн.)"
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "report_type": "weekly",
+        "end_day": end_day_label,
+        "days": days_count,
+        "file_stem": file_stem,
+        "model": gemini_override or gemini_client.model_for_step("weekly", None),
+    }
+
+    if not storage_client.is_configured():
+        result["error"] = "gcs_not_configured"
+        return JSONResponse(result, status_code=502)
+
+    archives = storage_client.fetch_weekly_archives(end_day=end_day_label, days=days_count)
+    result["archives"] = {
+        "start_day": archives.get("start_day"),
+        "end_day": archives.get("end_day"),
+        "garmin_days_found": archives.get("garmin_days_found"),
+        "food_days_found": archives.get("food_days_found"),
+        "missing": archives.get("missing"),
+    }
+
+    if not archives.get("ok"):
+        result["error"] = archives.get("error")
+        result["detail"] = archives.get("day_labels")
+        return JSONResponse(result, status_code=502)
+
+    start_day_label = str(archives.get("start_day") or end_day_label)
+    period_label = f"{start_day_label} — {end_day_label}"
+
+    context_prep = report_formats.prepare_weekly_gemini_context(
+        garmin_archives=archives["garmin_archives"],
+        food_archives=archives.get("food_archives") or [],
+    )
+    result["context_mode"] = context_prep.get("context_mode")
+    result["input_est_tokens"] = context_prep.get("est_tokens")
+    result["input_est_tokens_full"] = context_prep.get("est_tokens_full")
+    result["free_tier_fallback"] = context_prep.get("free_tier_fallback")
+
+    general_notes = _load_general_notes(result)
+    medical_notes = _load_medical_data(result)
+
+    weekly = gemini_client.analyze_weekly_archives(
+        context_text=context_prep["text"],
+        context_prep=context_prep,
+        start_day=start_day_label,
+        end_day=end_day_label,
+        general_notes=general_notes,
+        medical_notes=medical_notes,
+        model=gemini_override,
+    )
+    result["weekly_analysis_ok"] = bool(weekly.get("ok"))
+    _note_gemini_failure(result, weekly, "weekly")
+
+    html_body = ""
+    if weekly.get("ok"):
+        result["ok"] = True
+        weekly_model = weekly.get("model") or result["model"]
+        result["model"] = weekly_model
+        html_body = report_formats.build_weekly_email_html(
+            period_label=period_label,
+            analysis_result=weekly,
+            model=weekly_model,
+            context_prep=context_prep,
+            archives_meta=archives,
+        )
+        if save_reports:
+            outcome_up = storage_client.upload_to_outcomes(f"{file_stem}.html", html_body)
+            result["storage_outcomes"] = outcome_up
+            if outcome_up.get("ok"):
+                logger.info("GCS weekly outcome saved: %s", outcome_up.get("gs_uri"))
+            else:
+                logger.error("GCS weekly outcome failed: %s", outcome_up)
+    else:
+        result["error"] = weekly.get("error")
+        result["weekly_analysis_error"] = weekly.get("error")
+
+    if send:
+        if not weekly.get("ok"):
+            result["emailed"] = False
+            result["email_error"] = weekly.get("error") or "weekly_analysis_not_available"
+        elif not email_client.is_configured():
+            result["emailed"] = False
+            result["email_error"] = "smtp_not_configured"
+        else:
+            subject = f"MyBody — недельный отчёт ({start_day_label} — {end_day_label})"
+            if context_prep.get("free_tier_fallback"):
+                subject += " [сокращённый контекст]"
+            text_alt = weekly.get("analysis") or "Недельный отчёт MyBody."
+            if context_prep.get("free_tier_fallback"):
+                text_alt = (
+                    "⚠ Контекст для Gemini был сокращён до FACT-digest (полные архивы в GCS).\n\n"
+                    + text_alt
+                )
+            sent = email_client.send_email(subject, html_body, text_body=text_alt)
+            result["emailed"] = bool(sent.get("ok"))
+            if sent.get("ok"):
+                result["recipients"] = sent.get("to")
+            else:
+                result["email_error"] = sent.get("error")
+                result["email_detail"] = sent.get("detail")
+
+    if result.get("gemini_daily_quota"):
+        result["ok"] = False
+        result.setdefault("partial", True)
+
+    status = 200 if result.get("ok") else (503 if gemini_client.is_retryable_gemini_error(str(result.get("error"))) else 502)
+    if result.get("ok") and send and result.get("email_error") and not result.get("emailed"):
+        status = 502
     return JSONResponse(result, status_code=status)
 
 

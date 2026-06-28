@@ -30,12 +30,17 @@ MORNING_REPORT_MODEL = """
 Источники данных:
 - Питание по фото и субъективные заметки — за календарный день D−1 (вчера).
 - Активность Garmin (шаги, тренировки, дневной стресс/HRV, Body Battery в течение дня) — за D−1.
-- Сон и пробуждение — прошедшая ночь: sleep_data за D (ночь с вечера D−1 до утра D).
+- Сон и пробуждение — ТОЛЬКО одна прошедшая ночь: sleep_report / sleep_data за sleep_day = D (дата пробуждения).
 
-В metrics_by_day обычно два дня (D−1 и D) — бери метрики из нужного блока:
-- D−1: stats, activities, stress_data, body_battery (дневная динамика), heart_rates и т.д.
-- D: sleep_data, morning_training_readiness, утренний Body Battery после пробуждения.
-- sleep_data за D−1 — более ранняя ночь; не путай её с «прошедшей ночью» отчёта.
+Сон — один источник, без путаницы:
+- Цифры по сну бери ТОЛЬКО из блока sleep_report или sleep_data за sleep_day (D).
+- НЕ используй sleep_data за activity_day (D−1) — это более ранняя ночь, не «прошедшая» для этого отчёта.
+- НЕ смешивай сон двух дат в одном абзаце и не сравнивай две ночи, если не просят явно.
+- Если sleep_report.found=true — опирайся на него в первую очередь (минуты уже можно пересчитать из секунд там).
+
+В metrics_by_day:
+- D−1 (activity_day): stats, activities, stress, body_battery — без sleep_data.
+- D (sleep_day): sleep_data и утренние метрики пробуждения.
 
 Хронология нарратива:
 1) Как прошёл вчера (D−1): нагрузка, питание, заметки.
@@ -292,9 +297,27 @@ def _compact(value: Any, profile: dict[str, int]) -> Any:
 
 def _render_context(metrics: dict[str, Any], note: str = "") -> str:
     """Собирает текстовый контекст из (возможно ужатого) словаря метрик."""
-    parts = [f"Период: с {metrics.get('from', '')} по {metrics.get('to', '')}."]
+    parts: list[str] = []
+    if metrics.get("report_context"):
+        parts += [
+            "=== Контекст утреннего отчёта (report_context) ===",
+            json.dumps(metrics["report_context"], ensure_ascii=False, indent=2, default=str),
+        ]
+    sleep_report = metrics.get("sleep_report")
+    if isinstance(sleep_report, dict) and sleep_report.get("found"):
+        parts += [
+            "",
+            "=== Сон прошедшей ночи (sleep_report — ЕДИНСТВЕННЫЙ источник цифр по сну) ===",
+            json.dumps(sleep_report, ensure_ascii=False, indent=2, default=str),
+        ]
+    parts.append(f"Период: с {metrics.get('from', '')} по {metrics.get('to', '')}.")
     if note:
         parts.append(note)
+    if metrics.get("report_day"):
+        parts.append(
+            "ВАЖНО: для сна используй только sleep_report / sleep_data за sleep_day. "
+            "sleep_data на activity_day в metrics_by_day отсутствует намеренно."
+        )
     parts += [
         "",
         "=== Активности ===",
@@ -416,11 +439,19 @@ SYSTEM_PROMPT_DETAILED = """Ты — медицинско-спортивный �
 - data_completeness: high/medium/low и что отсутствует для уверенных выводов
 
 ## sleep
-Экспертная интерпретация sleep_data за report_day D: прошедшая ночь (с вечера D−1 до утра D).
-Качество, фазы deep/REM (только в минутах — см. формат выше), ЧСС во сне, SpO2, что мешало восстановлению,
-связь с утренними метриками на D.
-Учитывай влияние активности, стресса и питания вчера (D−1) на этот сон — это допустимая cross-day связь.
-Не используй sleep_data за D−1 как «прошедшую ночь» отчёта.
+Интерпретация ТОЛЬКО sleep_report / sleep_data за sleep_day (D) — одна прошедшая ночь.
+Качество, фазы deep/REM (только в минутах), ЧСС во сне, SpO2, восстановление, утренние метрики.
+Учитывай влияние активности/питания D−1 на этот сон. Не используй sleep_data за D−1.
+
+## sleep_metrics
+Структурированные метрики этой ночи для трендов (week/month/year) — все доступные поля, иначе «нет данных».
+Минуты — целые; время — HH:MM:
+- sleep_day, night_label
+- total_sleep_min, deep_sleep_min, light_sleep_min, rem_sleep_min, awake_min
+- restless_moments, bedtime, wake_time
+- sleep_score_overall, sleep_score_quality, sleep_score_recovery, sleep_score_duration, sleep_score_stress
+- sleep_quality_type, sleep_feedback, validation
+- avg_hr_sleep, min_hr_sleep, avg_sleep_stress, avg_respiration, avg_spo2, lowest_spo2
 
 ## stress_and_hrv
 Стресс и HRV за activity_day D−1 (stress_data, all_day_stress, hrv_data). Пики, вероятные причины,
@@ -484,7 +515,12 @@ stats_and_body, goals/user_profile — если есть и влияет на в
 
 ## facts_for_aggregation
 Компактные атомарные факты для машинного сведения при недельном/месячном merge — одна строка на факт:
+- FACT | category=sleep | metric=total_sleep_min | value=N | date=sleep_day
+- FACT | category=sleep | metric=deep_sleep_min | value=N | date=sleep_day
+- FACT | category=sleep | metric=rem_sleep_min | value=N | date=sleep_day
+- FACT | category=sleep | metric=sleep_score_overall | value=N | date=sleep_day
 - FACT | category=... | severity=... | summary=... | evidence=...
+(заполни все доступные sleep_metrics из sleep_report)
 
 Правила:
 - Язык: русский.
@@ -595,8 +631,16 @@ def model_for_step(step: str, override: str | None = None) -> str:
         "archive": "GEMINI_MODEL",
         "food": "GEMINI_MODEL_FOOD",
         "combined": "GEMINI_MODEL_COMBINED",
+        "weekly": "GEMINI_MODEL_WEEKLY",
     }.get(step, "GEMINI_MODEL")
-    return (os.environ.get(env_key, "") or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+    default = DEFAULT_GEMINI_MODEL
+    if step == "weekly":
+        default = (
+            os.environ.get("GEMINI_MODEL_WEEKLY", "").strip()
+            or os.environ.get("GEMINI_MODEL_COMBINED", "").strip()
+            or DEFAULT_GEMINI_MODEL
+        )
+    return (os.environ.get(env_key, "") or default).strip() or DEFAULT_GEMINI_MODEL
 
 
 def analyze_garmin_metrics(metrics: dict[str, Any], model: str | None = None) -> dict[str, Any]:
@@ -639,9 +683,8 @@ def analyze_garmin_metrics_detailed(
         system_instruction=SYSTEM_PROMPT_DETAILED,
         user_intro=(
             "Ниже сырые данные Garmin Connect для утреннего отчёта (report_day = дата пробуждения). "
-            "Активность, стресс и нагрузка — за вчера (D−1); sleep_data на report_day D — прошедшая ночь. "
-            "Если есть субъективные заметки — они за вчера (D−1), учитывай для пульса, стресса и Body Battery. "
-            "Если есть medical_data — сопоставь Garmin с лабораторными и клиническими показателями. "
+            "Активность, стресс и нагрузка — за вчера (D−1); сон — только sleep_report за sleep_day (D). "
+            "Не смешивай сон двух дат. Если есть medical_data — сопоставь Garmin с лабораторными показателями. "
             "Сформируй экспертный отчёт по обязательной структуре. "
             "Не переписывай сырые данные. "
             "Текст позже объединят для анализа трендов за неделю/месяц."
@@ -956,9 +999,12 @@ SYSTEM_PROMPT_COMBINED = """Ты — персональный health-coach: сп
 Кратко: что пользователь сам отметил за вчера (D−1) и как это может объяснить метрики Garmin и сон прошедшей ночи.
 
 ## garmin_key_points
-Главное из Garmin: сон (sleep_data на D; фазы deep/REM — в минутах, не в секундах), вчерашний стресс/HRV
-и нагрузка (D−1), Body Battery — списком,
-каждый пункт с тегом [good|warn|neutral|bad] и **меткой:** (см. правила оценки ниже).
+Главное из Garmin — строго раздели блоки по датам:
+### Сон (ночь → D, только sleep_report / sleep_day)
+Одна прошедшая ночь: фазы в минутах, качество, пробуждения, HRV/стресс сна — только цифры за эту ночь.
+### Активность (D−1)
+Вчерашний стресс/HRV, нагрузка, Body Battery — только за activity_day.
+Не смешивай сон двух дат. Каждый пункт: тег [good|warn|neutral|bad] и **метка:**
 
 ## nutrition_key_points
 Главное из питания за D−1 — списком с тегами и **метками:** как выше.
@@ -1015,6 +1061,115 @@ SYSTEM_PROMPT_COMBINED = """Ты — персональный health-coach: сп
 - Не дублируй длинные архивные тексты — синтезируй.
 - Не ставь медицинских диагнозов.
 - watch_out — без медицинских/лабораторных проблем; medical_key_points — единственное место для анализов."""
+
+
+SYSTEM_PROMPT_WEEKLY = """Ты — эксперт по здоровью, сну, нагрузке и питанию. Тебе переданы архивные дневные
+отчёты MyBody за несколько календарных дней (экспертные выводы Gemini + метаданные, иногда FACT-digest).
+
+ЗАДАЧА: недельный мета-анализ — тренды, паттерны, аномалии, приоритеты на следующую неделю.
+Фокус на сне (длительность, фазы, качество, пробуждения), recovery, связи «нагрузка/питание → сон».
+
+Если вход — FACT-digest (JSON): опирайся на key_metrics, sleep_metrics и строки FACT; не выдумывай цифры.
+Если вход — полные архивы: синтезируй, не переписывай дословно каждый день.
+
+ОБЯЗАТЕЛЬНАЯ СТРУКТУРА (заголовки ## на английском, текст на русском):
+
+## executive_summary
+3–5 предложений: главный вывод недели по сну, нагрузке и питанию.
+
+## sleep_weekly_trends
+Тренды сна за период: средние/мин/макс total sleep, deep, REM, restless, sleep score;
+лучшие и худшие ночи (даты); гипотезы причин (нагрузка, питание, стресс Garmin).
+
+## activity_and_recovery
+Шаги, стресс, Body Battery, тренировки — паттерны недели и влияние на сон.
+
+## nutrition_weekly_patterns
+Если есть food-архивы: калории, белок, клетчатка, дефициты/избытки, влияние на сон и recovery.
+Если питания мало или нет — явно укажи.
+
+## cross_domain_insights
+Связи между днями: что повторялось, что коррелировало (сон ↔ нагрузка ↔ питание).
+
+## recommendations_next_week
+5–8 конкретных рекомендаций с приоритетом (high/medium/low). Формат пункта:
+- **[warn] Сон:** … или - **[good] Питание:** …
+
+## watch_out
+2–4 пункта рисков/зон внимания (без лабораторных диагнозов).
+
+## data_coverage
+Какие дни представлены, чего не хватало во входе; если был FACT-digest — отметь ограничение детализации.
+
+Правила:
+- Язык: русский.
+- Не ставь медицинских диагнозов.
+- Стресс Garmin = HRV-метрика, не психология.
+- Длительность сна в минутах или «X ч Y мин», не секунды.
+- Не придумывай метрики, которых нет во входе."""
+
+
+def analyze_weekly_archives(
+    *,
+    context_text: str,
+    context_prep: dict[str, Any],
+    start_day: str,
+    end_day: str,
+    general_notes: str | None = None,
+    medical_notes: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """
+    Недельный мета-анализ по сохранённым GCS-архивам (полные MD или FACT-digest).
+    """
+    if genai is None or types is None:
+        return {"ok": False, "error": "gemini_sdk_not_installed", "analysis": None}
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"ok": False, "error": "gemini_not_configured", "analysis": None}
+    if not context_text.strip():
+        return {"ok": False, "error": "empty_weekly_context", "analysis": None}
+
+    model = model_for_step("weekly", model)
+    mode = context_prep.get("context_mode") or "full"
+    mode_note = (
+        "Вход сокращён до FACT-digest (key_metrics, sleep_metrics, FACT-строки)."
+        if mode == "fact_digest"
+        else "Вход — полные сохранённые архивы за каждый день."
+    )
+    context_blocks = _format_user_context_blocks(
+        general_notes=general_notes,
+        medical_notes=medical_notes,
+    )
+    user_parts = [
+        f"Недельный отчёт MyBody: период {start_day} … {end_day} ({context_prep.get('est_tokens', '?')} токенов входа, режим {mode}).",
+        mode_note,
+        "Сформируй отчёт по обязательной структуре из инструкции.",
+    ]
+    if context_blocks:
+        user_parts.append(context_blocks)
+    user_parts.append(f"=== Архивные данные за период ({mode}) ===\n{context_text.strip()}")
+    user_content = "\n\n".join(user_parts)
+
+    meta = {
+        **context_prep,
+        "start_day": start_day,
+        "end_day": end_day,
+        "context_mode": mode,
+        "has_general_notes": bool(general_notes and general_notes.strip()),
+        "has_medical_notes": bool(medical_notes and medical_notes.strip()),
+    }
+
+    return _generate_with_retry(
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT_WEEKLY,
+            temperature=0.3,
+            max_output_tokens=16384,
+        ),
+        model=model,
+        context_meta=meta,
+    )
 
 
 def analyze_daily_combined(
