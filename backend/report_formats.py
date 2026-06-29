@@ -407,6 +407,145 @@ def build_weekly_email_html(
 </html>"""
 
 
+def _pipeline_failure_detail_rows(result: dict[str, Any], report_type: str) -> list[tuple[str, str]]:
+    """Пары (метка, значение) для письма о сбое pipeline."""
+    rows: list[tuple[str, str]] = []
+
+    def add(label: str, key: str, *, alt: str | None = None) -> None:
+        val = result.get(key) if alt is None else result.get(alt)
+        if val is not None and str(val).strip():
+            rows.append((label, str(val).strip()))
+
+    add("Ошибка", "error")
+    add("Детали", "detail")
+    add("Подсказка", "hint")
+    add("Ошибка email", "email_error")
+    add("Детали SMTP", "email_detail")
+
+    if result.get("gemini_daily_quota"):
+        rows.append(("Квота Gemini", "исчерпан дневной лимит free tier"))
+    add("Gemini", "gemini_hint")
+
+    if report_type == "daily":
+        add("Garmin archive", "detailed_analysis_error")
+        add("Питание", "food_analysis_error")
+        if result.get("food_analysis_skipped"):
+            rows.append(("Питание пропущено", str(result["food_analysis_skipped"])))
+        add("Итоговый отчёт", "combined_analysis_error")
+        if result.get("partial"):
+            rows.append(("Частичный успех", "да — отчёт в письме не отправлен"))
+        storage = result.get("storage_archive") or {}
+        if isinstance(storage, dict) and storage.get("ok") is False:
+            rows.append(("GCS archive", str(storage.get("error", "upload failed"))))
+        outcomes = result.get("storage_outcomes") or {}
+        if isinstance(outcomes, dict) and outcomes.get("ok") is False:
+            rows.append(("GCS outcomes", str(outcomes.get("error", "upload failed"))))
+    else:
+        add("Weekly анализ", "weekly_analysis_error")
+        archives = result.get("archives") or {}
+        if isinstance(archives, dict):
+            gf = archives.get("garmin_days_found")
+            ff = archives.get("food_days_found")
+            if gf is not None:
+                rows.append(("Архивов Garmin", str(gf)))
+            if ff is not None:
+                rows.append(("Архивов food", str(ff)))
+        if result.get("context_mode"):
+            rows.append(("Режим контекста", str(result["context_mode"])))
+
+    models = result.get("gemini_models_tried")
+    if isinstance(models, dict) and models:
+        for step, tried in models.items():
+            if tried:
+                rows.append((f"Модели ({step})", ", ".join(str(m) for m in tried)))
+
+    return rows
+
+
+def build_pipeline_failure_text(
+    *,
+    report_type: str,
+    period_label: str,
+    result: dict[str, Any],
+    logs_url: str | None = None,
+) -> str:
+    title = "дневного" if report_type == "daily" else "недельного"
+    lines = [
+        f"MyBody — сбой {title} отчёта",
+        f"Период: {period_label}",
+        "",
+    ]
+    for label, value in _pipeline_failure_detail_rows(result, report_type):
+        lines.append(f"{label}: {value}")
+    if logs_url:
+        lines.extend(["", f"Логи Cloud Run: {logs_url}"])
+    lines.append("")
+    lines.append("Проверьте Cloud Run Logs и повторите запуск вручную при необходимости.")
+    return "\n".join(lines)
+
+
+def build_pipeline_failure_email_html(
+    *,
+    report_type: str,
+    period_label: str,
+    result: dict[str, Any],
+    logs_url: str | None = None,
+) -> str:
+    title_adj = "дневного" if report_type == "daily" else "недельного"
+    td = 'style="border:1px solid #e8eaed;padding:8px 10px;font-size:14px;vertical-align:top;"'
+
+    detail_rows = _pipeline_failure_detail_rows(result, report_type)
+    if detail_rows:
+        body_rows = "".join(
+            f"<tr><td {td}><strong>{html.escape(label)}</strong></td>"
+            f"<td {td}>{html.escape(value)}</td></tr>"
+            for label, value in detail_rows
+        )
+        details_table = (
+            f'<table style="border-collapse:collapse;width:100%;margin:12px 0;">'
+            f"<tbody>{body_rows}</tbody></table>"
+        )
+    else:
+        details_table = '<p style="color:#666;">Подробности смотрите в логах Cloud Run.</p>'
+
+    quota_banner = ""
+    if result.get("gemini_daily_quota"):
+        quota_banner = (
+            '<div style="background:#fde8e8;border:1px solid #e8a0a0;padding:12px 14px;'
+            'margin:0 0 16px;border-radius:6px;font-size:14px;color:#7a1f1f;">'
+            "<strong>Исчерпана дневная квота Gemini (free tier).</strong> "
+            "Дождитесь сброса лимита (UTC) или задайте другие модели в env."
+            "</div>"
+        )
+
+    logs_block = ""
+    if logs_url:
+        safe_url = html.escape(logs_url)
+        logs_block = (
+            f'<p style="margin:16px 0 8px;">'
+            f'<a href="{safe_url}" style="color:#1a56db;">Открыть логи Cloud Run</a>'
+            f"</p>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;background:#f5f6f8;">
+  <div style="max-width:680px;margin:0 auto;padding:24px 20px;font-family:Arial,Helvetica,sans-serif;color:#222;line-height:1.55;">
+    <h1 style="font-size:22px;margin:0 0 4px;color:#a33;">MyBody — сбой {html.escape(title_adj)} отчёта</h1>
+    <div style="color:#888;font-size:13px;margin-bottom:16px;">период: {html.escape(period_label)}</div>
+    {quota_banner}
+    <p style="font-size:15px;margin:0 0 8px;">
+      Обычное письмо с отчётом <strong>не отправлено</strong>. Краткая диагностика ниже.
+    </p>
+    {details_table}
+    {logs_block}
+    <div style="color:#aaa;font-size:12px;margin-top:20px;">Автоматическое уведомление MyBody (pipeline failure alert).</div>
+  </div>
+</body>
+</html>"""
+
+
 _BJU_LINE_RE = re.compile(
     r"БЖУ:\s*kcal\s+([\d.]+)\s*\|\s*белок\s+([\d.]+)\s*г\s*\|\s*жир\s+([\d.]+)\s*г\s*"
     r"\|\s*углев\s+([\d.]+)\s*г\s*\|\s*клетчатка\s+([\d.]+)\s*г",

@@ -254,6 +254,8 @@ curl -X POST "https://YOUR_SERVICE_URL/internal/weekly-report?send=false&days=7"
 
 **GCS outcomes:** daily → `outcomes/vb-YYYYMMDD-HHMM.html`; weekly → `outcomes/weekly-vb-YYYYMMDD-HHMM.html`.
 
+**Мониторинг сбоев:** приложение шлёт письмо при сбое pipeline (`PIPELINE_FAILURE_ALERTS`); GCP-алерты — только «дыры» (см. [docs/gcp-monitoring.md](docs/gcp-monitoring.md), `scripts/setup_gcp_alerts.ps1`).
+
 ### Переменные окружения email-отчёта
 
 | Переменная | Откуда | Описание |
@@ -267,6 +269,8 @@ curl -X POST "https://YOUR_SERVICE_URL/internal/weekly-report?send=false&days=7"
 | `GEMINI_INTER_CALL_DELAY_SEC` | env при деплое (65) | Пауза между кратким и подробным вызовом Gemini (сек), чтобы не упираться в TPM/мин |
 | `GEMINI_MODEL_WEEKLY` | env (опц.) | Модель для `/internal/weekly-report`; по умолчанию `GEMINI_MODEL_COMBINED` → `GEMINI_MODEL` |
 | `WEEKLY_MAX_INPUT_TOKENS` | env (опц., 220000) | Бюджет входа для weekly; при превышении — FACT-digest |
+| `PIPELINE_FAILURE_ALERTS` | env (опц., true) | Письмо-алерт при сбое daily/weekly, если отчёт не отправлен |
+| `CLOUD_RUN_LOGS_URL` | env (опц.) | Ссылка на логи в alert-письме; иначе строится из `K_SERVICE` + project |
 
 ### Google Drive — сохранение отчётов
 

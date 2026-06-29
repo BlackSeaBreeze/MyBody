@@ -503,6 +503,92 @@ def _daily_email_html(
 </html>"""
 
 
+def _cloud_run_logs_url() -> str | None:
+    """Ссылка на логи сервиса в GCP Console (Cloud Run задаёт K_SERVICE автоматически)."""
+    custom = os.environ.get("CLOUD_RUN_LOGS_URL", "").strip()
+    if custom:
+        return custom
+    service = os.environ.get("K_SERVICE", "").strip()
+    project = (
+        os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        or os.environ.get("GCP_PROJECT", "").strip()
+    )
+    region = os.environ.get("CLOUD_RUN_REGION", "europe-west1").strip() or "europe-west1"
+    if service and project:
+        return (
+            f"https://console.cloud.google.com/run/detail/{region}/{service}/logs"
+            f"?project={project}"
+        )
+    return None
+
+
+def _failure_alerts_enabled() -> bool:
+    return os.environ.get("PIPELINE_FAILURE_ALERTS", "true").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _maybe_send_failure_alert(
+    result: dict[str, Any],
+    *,
+    report_type: str,
+    period_label: str,
+    send: bool,
+) -> None:
+    """Письмо-алерт, если отчёт не ушёл получателю (send=true, emailed≠true)."""
+    if not send or not _failure_alerts_enabled():
+        return
+    if result.get("emailed"):
+        return
+    if not email_client.is_configured():
+        result["failure_alert_skipped"] = "smtp_not_configured"
+        return
+
+    logs_url = _cloud_run_logs_url()
+    title_adj = "дневного" if report_type == "daily" else "недельного"
+    subject = f"MyBody — сбой {title_adj} отчёта ({period_label})"
+    if result.get("gemini_daily_quota"):
+        subject += " [квота Gemini]"
+
+    html_body = report_formats.build_pipeline_failure_email_html(
+        report_type=report_type,
+        period_label=period_label,
+        result=result,
+        logs_url=logs_url,
+    )
+    text_body = report_formats.build_pipeline_failure_text(
+        report_type=report_type,
+        period_label=period_label,
+        result=result,
+        logs_url=logs_url,
+    )
+    sent = email_client.send_email(subject, html_body, text_body=text_body)
+    result["failure_alert_emailed"] = bool(sent.get("ok"))
+    if sent.get("ok"):
+        result["failure_alert_recipients"] = sent.get("to")
+        logger.info("Pipeline failure alert sent (%s, %s)", report_type, period_label)
+    else:
+        result["failure_alert_error"] = sent.get("error")
+        result["failure_alert_detail"] = sent.get("detail")
+        logger.error("Pipeline failure alert failed: %s", sent.get("error"))
+
+    if not result.get("emailed") and not result.get("failure_alert_emailed"):
+        reason = (
+            result.get("failure_alert_skipped")
+            or result.get("failure_alert_error")
+            or ("alerts_disabled" if not _failure_alerts_enabled() else "unknown")
+        )
+        logger.error(
+            "MYBODY_SAFETY_NET report_type=%s period=%s reason=%s",
+            report_type,
+            period_label,
+            reason,
+        )
+
+
 def _note_gemini_failure(result: dict, step_result: dict | None, step: str) -> None:
     if not step_result or step_result.get("ok"):
         return
@@ -519,6 +605,9 @@ def _note_gemini_failure(result: dict, step_result: dict | None, step: str) -> N
 
 
 def _daily_report_http_status(result: dict, *, send: bool, save_reports: bool) -> int:
+    # Cron 2xx: пользователь уведомлён письмом о сбое (п.1) — не дублировать GCP Scheduler alert
+    if result.get("failure_alert_emailed"):
+        return 200
     if not result.get("ok"):
         return 502
     if result.get("gemini_daily_quota"):
@@ -787,6 +876,9 @@ def daily_report(
             result["detail"] = metrics["detail"]
         if metrics.get("hint"):
             result["hint"] = metrics["hint"]
+        _maybe_send_failure_alert(
+            result, report_type="daily", period_label=day_label, send=send
+        )
         return JSONResponse(result, status_code=502)
 
     summary = garmin_client.summary_from_metrics(metrics)
@@ -1007,6 +1099,9 @@ def daily_report(
     if result.get("gemini_daily_quota"):
         result["ok"] = False
         result.setdefault("partial", True)
+    _maybe_send_failure_alert(
+        result, report_type="daily", period_label=day_label, send=send
+    )
     return JSONResponse(result, status_code=status)
 
 
@@ -1049,6 +1144,9 @@ def weekly_report(
 
     if not storage_client.is_configured():
         result["error"] = "gcs_not_configured"
+        _maybe_send_failure_alert(
+            result, report_type="weekly", period_label=period_label, send=send
+        )
         return JSONResponse(result, status_code=502)
 
     archives = storage_client.fetch_weekly_archives(end_day=end_day_label, days=days_count)
@@ -1063,6 +1161,9 @@ def weekly_report(
     if not archives.get("ok"):
         result["error"] = archives.get("error")
         result["detail"] = archives.get("day_labels")
+        _maybe_send_failure_alert(
+            result, report_type="weekly", period_label=period_label, send=send
+        )
         return JSONResponse(result, status_code=502)
 
     start_day_label = str(archives.get("start_day") or end_day_label)
@@ -1145,8 +1246,13 @@ def weekly_report(
         result.setdefault("partial", True)
 
     status = 200 if result.get("ok") else (503 if gemini_client.is_retryable_gemini_error(str(result.get("error"))) else 502)
-    if result.get("ok") and send and result.get("email_error") and not result.get("emailed"):
+    if result.get("failure_alert_emailed"):
+        status = 200
+    elif result.get("ok") and send and result.get("email_error") and not result.get("emailed"):
         status = 502
+    _maybe_send_failure_alert(
+        result, report_type="weekly", period_label=period_label, send=send
+    )
     return JSONResponse(result, status_code=status)
 
 

@@ -14,38 +14,29 @@
 
 **Идея:** короткое письмо «MyBody: daily failed» с `error`, `gemini_daily_quota`, ссылкой на логи Cloud Run.
 
-**Статус:** не начато
+**Статус:** сделано — `_maybe_send_failure_alert` в daily/weekly при `send=true` и отсутствии обычного письма; env `PIPELINE_FAILURE_ALERTS` (по умолчанию включено), `CLOUD_RUN_LOGS_URL` (опц.).
 
 ---
 
-### 2. Идемпотентность daily
+### 2. Алерты в GCP (без дублирования с п.1)
 
-Перед запуском проверять: есть ли уже `archive/vb-YYYYMMDD-*.md` за `report_day`.
+**Не дублировать** email из приложения:
 
-Если есть и не передан `force=true` — не дергать Garmin и 3× Gemini повторно.
+- при успешном failure-alert endpoint возвращает **HTTP 200** → Scheduler не считает job проваленным;
+- **не** алертить на все 5xx Cloud Run для `/internal/*`.
 
-**Зачем:** экономия квоты Gemini, стабильность при retry Cloud Scheduler.
+**GCP ловит дыры:**
 
-**Статус:** не начато
+- Scheduler `attempt_failed` (timeout, 502 когда письмо не ушло);
+- лог `MYBODY_SAFETY_NET` — pipeline упал, failure-alert не отправлен (SMTP, crash).
 
----
-
-### 3. Алерты в GCP
-
-Cloud Monitoring на:
-
-- failed executions Cloud Scheduler;
-- Cloud Run 5xx на `/internal/daily-report` и `/internal/weekly-report`.
-
-**Зачем:** не узнавать о проблеме только по отсутствию письма.
-
-**Статус:** не начато
+**Статус:** сделано — `scripts/setup_gcp_alerts.ps1`, `docs/gcp-monitoring.md`, лог `MYBODY_SAFETY_NET` в `main.py`.
 
 ---
 
 ## Сон (главный фокус)
 
-### 4. Rollup сна в коде до Gemini
+### 3. Rollup сна в коде до Gemini
 
 Для weekly (и позже monthly) считать в Python из `key_metrics` / `sleep_metrics`:
 
@@ -59,7 +50,7 @@ Cloud Monitoring на:
 
 ---
 
-### 5. Мини-таблица сна в weekly-письме
+### 4. Мини-таблица сна в weekly-письме
 
 7 строк: дата | сон | score | restless — из архивов, без Gemini.
 
@@ -69,7 +60,7 @@ Cloud Monitoring на:
 
 ---
 
-### 6. Единый `sleep_metrics` в архиве
+### 5. Единый `sleep_metrics` в архиве
 
 Сейчас в GCS в основном текст Gemini.
 
@@ -81,7 +72,7 @@ Cloud Monitoring на:
 
 ---
 
-### 7. Формат длительности сна
+### 6. Формат длительности сна
 
 > **Сделано:** `format_sleep_duration` — >60 мин → `ч:мм` (7:05), иначе «N мин»; email, Garmin view, промпты Gemini.
 
@@ -89,7 +80,7 @@ Cloud Monitoring на:
 
 ## Weekly / мета-анализ
 
-### 8. Сохранять weekly MD в GCS
+### 7. Сохранять weekly MD в GCS
 
 Сейчас только `outcomes/weekly-….html`.
 
@@ -99,7 +90,7 @@ Cloud Monitoring на:
 
 ---
 
-### 9. `count_tokens` перед weekly
+### 8. `count_tokens` перед weekly
 
 Вместо оценки `len/1.35` — реальный `count_tokens` от Gemini для решения full vs FACT-digest.
 
@@ -109,7 +100,7 @@ Cloud Monitoring на:
 
 ---
 
-### 10. Monthly на той же базе
+### 9. Monthly на той же базе
 
 Тот же endpoint с `days=30`, по умолчанию FACT-digest + rollup.
 
@@ -119,7 +110,7 @@ Cloud Monitoring на:
 
 ---
 
-### 11. Weekly report endpoint
+### 10. Weekly report endpoint
 
 > **Сделано:** `POST /internal/weekly-report` — полные архивы из GCS, fallback на FACT-digest, disclaimer в письме, cron +1 ч после daily.
 
@@ -127,7 +118,7 @@ Cloud Monitoring на:
 
 ## Питание
 
-### 12. Жёстче обрабатывать пропущенные фото
+### 11. Жёстче обрабатывать пропущенные фото
 
 Уже есть warnings.
 
@@ -137,7 +128,7 @@ Cloud Monitoring на:
 
 ---
 
-### 13. Weekly nutrition rollup
+### 12. Weekly nutrition rollup
 
 Из food-архивов: средние kcal, белок, клетчатка за неделю — таблица в письме + FACT для Gemini.
 
@@ -147,7 +138,7 @@ Cloud Monitoring на:
 
 ## Продукт
 
-### 14. Чат с контекстом
+### 13. Чат с контекстом
 
 В README — «чат с агентом», в API пока нет.
 
@@ -159,7 +150,7 @@ Cloud Monitoring на:
 
 ---
 
-### 15. Страница «статус»
+### 14. Страница «статус»
 
 `/status` или `/internal/status`: последний успешный daily/weekly, дата архива, версия деплоя, последняя ошибка Gemini.
 
@@ -171,7 +162,7 @@ Cloud Monitoring на:
 
 ## Качество кода
 
-### 16. Тесты на критичное
+### 15. Тесты на критичное
 
 Минимальный набор:
 
@@ -183,7 +174,7 @@ Cloud Monitoring на:
 
 ---
 
-### 17. Разбить `main.py`
+### 16. Разбить `main.py`
 
 ~1200 строк: daily + weekly + probes → `routes/daily.py`, `routes/weekly.py`, helpers.
 
@@ -191,7 +182,7 @@ Cloud Monitoring на:
 
 ---
 
-### 18. Синхронизировать README с реальностью
+### 17. Синхронизировать README с реальностью
 
 README ещё описывает Drive Shorts/Detailed как основное хранилище; фактически — GCS (`archive/`, `outcomes/`).
 
@@ -201,7 +192,7 @@ README ещё описывает Drive Shorts/Detailed как основное �
 
 ## Безопасность
 
-### 19. Усилить `/internal/*`
+### 18. Усилить `/internal/*`
 
 Сейчас: `CRON_SECRET` + публичный Cloud Run.
 
@@ -215,11 +206,11 @@ README ещё описывает Drive Shorts/Detailed как основное �
 
 | # | Задача | Зачем |
 |---|--------|--------|
-| 1 | Алерт при сбое daily/weekly | не пропускать «тихие» поломки |
-| 2 | `sleep_metrics` в frontmatter при daily save | точнее weekly, меньше магии парсера |
-| 3 | Rollup + таблица 7 дней в weekly email | ценность даже при FACT-digest |
-| 4 | Идемпотентность daily | квота Gemini + стабильность cron |
-| 5 | Weekly MD в GCS | фундамент для monthly и чата |
+| ~~1~~ | ~~Алерт при сбое daily/weekly~~ | ✓ сделано |
+| ~~2~~ | ~~GCP monitoring без дублирования~~ | ✓ сделано |
+| 3 | `sleep_metrics` в frontmatter при daily save | точнее weekly |
+| 4 | Rollup + таблица 7 дней в weekly email | ценность при FACT-digest |
+| 5 | Weekly MD в GCS | monthly и чат |
 
 ---
 
@@ -232,6 +223,7 @@ README ещё описывает Drive Shorts/Detailed как основное �
 | Weekly контекст | Сначала полные архивы; при >220k токенов — FACT-digest + disclaimer в письме |
 | Weekly cron | На 1 ч позже daily (напр. вс 10:00 vs daily 09:00, Europe/Dublin) |
 | Gemini free tier | 250k TPM = вход + выход; weekly бюджетировать `вход + max_output` |
+| Сбои | П.1 email в приложении; п.2 GCP только если письмо не ушло / Scheduler failed; HTTP 200 после успешного failure-alert |
 
 ---
 
