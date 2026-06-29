@@ -578,7 +578,7 @@ def extract_sleep_report(metrics: dict[str, Any]) -> dict[str, Any]:
             "found": True,
             "night_label": f"ночь → {sleep_day}",
             "total_sleep_min": total_min,
-            "total_sleep_hm": _seconds_to_hours_min(dto.get("sleepTimeSeconds")),
+            "total_sleep_hm": format_sleep_duration(seconds=dto.get("sleepTimeSeconds")),
             "deep_sleep_min": _sec_to_min(dto.get("deepSleepSeconds")),
             "light_sleep_min": _sec_to_min(dto.get("lightSleepSeconds")),
             "rem_sleep_min": _sec_to_min(dto.get("remSleepSeconds")),
@@ -624,15 +624,33 @@ def _morning_report_metrics_by_day(metrics: dict[str, Any]) -> dict[str, Any]:
     return filtered
 
 
-def _seconds_to_hours_min(seconds: int | float | None) -> str:
-    if seconds is None:
+def format_sleep_duration(
+    seconds: int | float | None = None,
+    *,
+    minutes: int | float | None = None,
+) -> str:
+    """
+    Длительность сна для UI и отчётов.
+    > 60 мин → ч:мм (например 7:05); иначе «N мин».
+    """
+    if seconds is not None:
+        try:
+            total_min = int(round(int(seconds) / 60))
+        except (TypeError, ValueError):
+            return "—"
+    elif minutes is not None:
+        try:
+            total_min = int(round(float(minutes)))
+        except (TypeError, ValueError):
+            return "—"
+    else:
         return "—"
-    s = int(seconds)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    if h > 0:
-        return f"{h}ч {m}мин"
-    return f"{m}мин"
+    if total_min <= 0:
+        return "—"
+    if total_min > 60:
+        h, m = divmod(total_min, 60)
+        return f"{h}:{m:02d}"
+    return f"{total_min} мин"
 
 
 def build_readable_summary(raw: dict[str, Any]) -> dict[str, Any]:
@@ -659,7 +677,7 @@ def build_readable_summary(raw: dict[str, Any]) -> dict[str, Any]:
             "steps": steps_with_goal,
             "steps_value": steps,
             "step_goal": goal,
-            "sleep": _seconds_to_hours_min(sleep_sec),
+            "sleep": format_sleep_duration(seconds=sleep_sec),
             "sleep_seconds": sleep_sec,
             "calories_total": int(s["totalKilocalories"]) if s.get("totalKilocalories") is not None else None,
             "calories_active": int(s["activeKilocalories"]) if s.get("activeKilocalories") is not None else None,

@@ -397,11 +397,35 @@ def _morning_report_table_html(summary: dict) -> str:
     sleep_rows = "".join(
         [
             _cell("Ночь (пробуждение)", sleep_day),
-            _cell("Всего сна", sleep.get("total_sleep_hm") or sleep.get("total_sleep_min")),
-            _cell("Глубокий сон", f'{sleep.get("deep_sleep_min")} мин' if sleep.get("deep_sleep_min") is not None else None),
-            _cell("Лёгкий сон", f'{sleep.get("light_sleep_min")} мин' if sleep.get("light_sleep_min") is not None else None),
-            _cell("REM", f'{sleep.get("rem_sleep_min")} мин' if sleep.get("rem_sleep_min") is not None else None),
-            _cell("Бодрствование", f'{sleep.get("awake_min")} мин' if sleep.get("awake_min") is not None else None),
+            _cell(
+                "Всего сна",
+                sleep.get("total_sleep_hm")
+                or garmin_client.format_sleep_duration(minutes=sleep.get("total_sleep_min")),
+            ),
+            _cell(
+                "Глубокий сон",
+                garmin_client.format_sleep_duration(minutes=sleep.get("deep_sleep_min"))
+                if sleep.get("deep_sleep_min") is not None
+                else None,
+            ),
+            _cell(
+                "Лёгкий сон",
+                garmin_client.format_sleep_duration(minutes=sleep.get("light_sleep_min"))
+                if sleep.get("light_sleep_min") is not None
+                else None,
+            ),
+            _cell(
+                "REM",
+                garmin_client.format_sleep_duration(minutes=sleep.get("rem_sleep_min"))
+                if sleep.get("rem_sleep_min") is not None
+                else None,
+            ),
+            _cell(
+                "Бодрствование",
+                garmin_client.format_sleep_duration(minutes=sleep.get("awake_min"))
+                if sleep.get("awake_min") is not None
+                else None,
+            ),
             _cell("Пробуждения", sleep.get("restless_moments")),
             _cell("Оценка сна", sleep.get("sleep_score_overall")),
             _cell("Качество", sleep.get("sleep_quality_type") or sleep.get("sleep_score_quality")),
