@@ -387,8 +387,17 @@ def _morning_report_table_html(summary: dict) -> str:
         f"</tr></thead><tbody>{act_row}</tbody></table>"
     )
 
+    vo2 = summary.get("vo2_max") or {}
+    vo2_note = ""
+    if vo2.get("found") and vo2.get("display"):
+        vo2_note = (
+            f'<p style="font-size:13px;color:#374151;margin:0 0 12px;">'
+            f"<strong>VO2 max</strong> ({html.escape(str(activity_day))}): "
+            f"{html.escape(str(vo2.get('display')))}</p>"
+        )
+
     if not sleep.get("found"):
-        return activity_table + '<p style="color:#888;font-size:13px;">Сон: нет данных за эту ночь.</p>'
+        return activity_table + vo2_note + '<p style="color:#888;font-size:13px;">Сон: нет данных за эту ночь.</p>'
 
     def _cell(label: str, val: Any) -> str:
         display = "—" if val is None or val == "" else html.escape(str(val))
@@ -428,7 +437,13 @@ def _morning_report_table_html(summary: dict) -> str:
             ),
             _cell("Пробуждения", sleep.get("restless_moments")),
             _cell("Оценка сна", sleep.get("sleep_score_overall")),
-            _cell("Качество", sleep.get("sleep_quality_type") or sleep.get("sleep_score_quality")),
+            _cell(
+                "Качество",
+                sleep.get("sleep_quality_label")
+                or sleep.get("sleep_quality_type")
+                or sleep.get("sleep_score_quality")
+                or sleep.get("sleep_score_stress"),
+            ),
             _cell("Отбой → подъём", f'{sleep.get("bedtime") or "?"} → {sleep.get("wake_time") or "?"}'),
             _cell("Пульс во сне (ср.)", sleep.get("avg_hr_sleep")),
             _cell("Стресс во сне (ср.)", sleep.get("avg_sleep_stress")),
@@ -440,7 +455,7 @@ def _morning_report_table_html(summary: dict) -> str:
         f'<table style="border-collapse:collapse;width:100%;margin:0 0 16px;">'
         f"<tbody>{sleep_rows}</tbody></table>"
     )
-    return activity_table + sleep_table
+    return activity_table + vo2_note + sleep_table
 
 
 def _gemini_sleep() -> int:

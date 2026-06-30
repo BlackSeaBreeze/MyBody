@@ -551,6 +551,97 @@ def _ts_label(ts: Any) -> str | None:
         return None
 
 
+def _dig(dto: dict[str, Any], *keys: str) -> Any:
+    """Первое непустое значение по списку ключей."""
+    for key in keys:
+        if not isinstance(dto, dict):
+            continue
+        val = dto.get(key)
+        if val is not None and val != "":
+            return val
+    return None
+
+
+def _sleep_payload_parts(sleep_data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Корень ответа get_sleep_data и вложенный dailySleepDTO."""
+    if not isinstance(sleep_data, dict):
+        return {}, {}
+    nested = sleep_data.get("dailySleepDTO")
+    if isinstance(nested, dict):
+        return sleep_data, nested
+    return sleep_data, sleep_data
+
+
+def _sleep_quality_label(dto: dict[str, Any], scores: dict[str, Any]) -> str | None:
+    """Качество сна: тип или квалификаторы из sleepScores (stress/quality/overall)."""
+    explicit = dto.get("sleepQualityType") or dto.get("sleepQuality")
+    if explicit:
+        return str(explicit)
+    parts: list[str] = []
+    for key, prefix in (
+        ("overall", "overall"),
+        ("quality", "quality"),
+        ("stress", "stress"),
+        ("awakeCount", "awake"),
+    ):
+        val = _sleep_score_value(scores, key)
+        if val is not None:
+            parts.append(f"{prefix}: {val}")
+    return " · ".join(parts) if parts else None
+
+
+def extract_vo2_max(max_metrics: Any) -> dict[str, Any]:
+    """
+    VO2 max из get_max_metrics (список блоков generic / cycling / running).
+    """
+    out: dict[str, Any] = {"found": False, "generic": None, "cycling": None, "display": None}
+    if max_metrics is None:
+        return out
+    items = max_metrics if isinstance(max_metrics, list) else [max_metrics]
+    labels: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for sport_key, sport_label in (("generic", "бег"), ("running", "бег"), ("cycling", "вело")):
+            block = item.get(sport_key)
+            if not isinstance(block, dict):
+                continue
+            value = block.get("vo2MaxPreciseValue")
+            if value is None:
+                value = block.get("vo2MaxValue")
+            if value is None:
+                continue
+            store_key = "generic" if sport_key == "running" else sport_key
+            if out.get(store_key) is None:
+                out[store_key] = value
+                labels.append(f"{sport_label} {value}")
+    if labels:
+        out["found"] = True
+        # Уникальные подписи (generic и running могут дублировать «бег»)
+        seen: set[str] = set()
+        unique: list[str] = []
+        for label in labels:
+            if label not in seen:
+                seen.add(label)
+                unique.append(label)
+        out["display"] = " · ".join(unique)
+    return out
+
+
+def extract_vo2_max_from_day_metrics(day: dict[str, Any]) -> dict[str, Any]:
+    """VO2 max за день: max_metrics, иначе mostRecentVO2Max из training_status."""
+    vo2 = extract_vo2_max(day.get("max_metrics"))
+    if vo2.get("found"):
+        return vo2
+    ts = day.get("training_status")
+    if not isinstance(ts, dict):
+        return vo2
+    recent = ts.get("mostRecentVO2Max")
+    if not isinstance(recent, dict):
+        return vo2
+    return extract_vo2_max(recent)
+
+
 def extract_sleep_report(metrics: dict[str, Any]) -> dict[str, Any]:
     """
     Структурированные метрики одной ночи (sleep_data на sleep_day = дата пробуждения).
@@ -567,25 +658,45 @@ def extract_sleep_report(metrics: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(sleep_data, dict):
         return out
 
-    dto = sleep_data.get("dailySleepDTO") or sleep_data
+    root, dto = _sleep_payload_parts(sleep_data)
     if not isinstance(dto, dict):
         return out
 
     scores = dto.get("sleepScores") or {}
-    total_min = _sec_to_min(dto.get("sleepTimeSeconds"))
+    restless = _dig(
+        root,
+        "restlessMomentsCount",
+        "restlessMomentCount",
+    )
+    if restless is None:
+        restless = _dig(
+            dto,
+            "restlessMomentsCount",
+            "restlessMomentCount",
+        )
+    avg_hr = _dig(
+        dto,
+        "avgHeartRate",
+        "averageSleepHeartRate",
+        "sleepHeartRate",
+        "restingHeartRate",
+    )
+    if avg_hr is None:
+        avg_hr = _dig(root, "avgHeartRate", "averageSleepHeartRate")
+
     out.update(
         {
             "found": True,
             "night_label": f"ночь → {sleep_day}",
-            "total_sleep_min": total_min,
+            "total_sleep_min": _sec_to_min(dto.get("sleepTimeSeconds")),
             "total_sleep_hm": format_sleep_duration(seconds=dto.get("sleepTimeSeconds")),
             "deep_sleep_min": _sec_to_min(dto.get("deepSleepSeconds")),
             "light_sleep_min": _sec_to_min(dto.get("lightSleepSeconds")),
             "rem_sleep_min": _sec_to_min(dto.get("remSleepSeconds")),
             "awake_min": _sec_to_min(dto.get("awakeSleepSeconds")),
-            "restless_moments": dto.get("restlessMomentCount"),
+            "restless_moments": restless,
             "avg_sleep_stress": dto.get("avgSleepStress"),
-            "avg_hr_sleep": dto.get("avgHeartRate") or dto.get("averageSleepHeartRate"),
+            "avg_hr_sleep": avg_hr,
             "min_hr_sleep": dto.get("lowestHeartRate") or dto.get("lowestHeartRateDuringSleep"),
             "max_hr_sleep": dto.get("highestHeartRate") or dto.get("maxHeartRate"),
             "avg_respiration": dto.get("averageRespiration") or dto.get("avgRespirationValue"),
@@ -596,7 +707,9 @@ def extract_sleep_report(metrics: dict[str, Any]) -> dict[str, Any]:
             "sleep_score_recovery": _sleep_score_value(scores, "recovery"),
             "sleep_score_duration": _sleep_score_value(scores, "duration"),
             "sleep_score_stress": _sleep_score_value(scores, "stress"),
+            "sleep_score_awake": _sleep_score_value(scores, "awakeCount"),
             "sleep_quality_type": dto.get("sleepQualityType") or dto.get("sleepQuality"),
+            "sleep_quality_label": _sleep_quality_label(dto, scores),
             "sleep_feedback": dto.get("sleepFeedback") or dto.get("sleepScoreFeedback"),
             "validation": dto.get("validation") or dto.get("sleepValidation"),
             "bedtime": _ts_label(dto.get("sleepStartTimestampLocal") or dto.get("sleepStartTimestampGMT")),
@@ -740,8 +853,11 @@ def build_morning_report_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     by_day = metrics.get("metrics_by_day") or {}
 
     activity_row: dict[str, Any] = {"date": activity_day, "label": f"Активность ({activity_day})"}
+    vo2_max: dict[str, Any] = {"found": False}
     if activity_day and activity_day in by_day:
-        stats = (by_day[activity_day] or {}).get("stats")
+        day_metrics = by_day[activity_day] or {}
+        vo2_max = extract_vo2_max_from_day_metrics(day_metrics)
+        stats = day_metrics.get("stats")
         if isinstance(stats, dict):
             partial = build_readable_summary(
                 {
@@ -762,5 +878,6 @@ def build_morning_report_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "sleep_day": sleep_report.get("sleep_day"),
         "activity": activity_row,
         "sleep": sleep_report,
+        "vo2_max": vo2_max,
         "days": [activity_row],
     }

@@ -46,6 +46,8 @@ def build_detailed_report_md(
     ctx = context_meta or {}
     generated_at = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
     day_row = (summary.get("days") or [{}])[0] if summary.get("days") else {}
+    vo2 = summary.get("vo2_max") or {}
+    sleep_km = metrics.get("sleep_report") if isinstance(metrics.get("sleep_report"), dict) else {}
 
     frontmatter = {
         "date": day_label,
@@ -68,6 +70,13 @@ def build_detailed_report_md(
             "body_battery_wake": day_row.get("body_battery_wake"),
             "body_battery_end": day_row.get("body_battery_end"),
             "resting_hr": day_row.get("resting_hr"),
+            "vo2_max": vo2.get("display"),
+            "vo2_max_generic": vo2.get("generic"),
+            "vo2_max_cycling": vo2.get("cycling"),
+            "sleep_score": sleep_km.get("sleep_score_overall"),
+            "restless_moments": sleep_km.get("restless_moments"),
+            "sleep_quality": sleep_km.get("sleep_quality_label"),
+            "avg_hr_sleep": sleep_km.get("avg_hr_sleep"),
             "activities_count": len(metrics.get("activities") or []),
         },
     }

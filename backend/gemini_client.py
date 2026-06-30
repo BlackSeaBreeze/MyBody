@@ -448,7 +448,8 @@ SYSTEM_PROMPT_DETAILED = """Ты — медицинско-спортивный �
 Минуты — целые; время — HH:MM:
 - sleep_day, night_label
 - total_sleep_min, deep_sleep_min, light_sleep_min, rem_sleep_min, awake_min
-- restless_moments, bedtime, wake_time
+- restless_moments, sleep_quality_label, sleep_score_stress / sleep_score_awake
+- bedtime, wake_time
 - sleep_score_overall, sleep_score_quality, sleep_score_recovery, sleep_score_duration, sleep_score_stress
 - sleep_quality_type, sleep_feedback, validation
 - avg_hr_sleep, min_hr_sleep, avg_sleep_stress, avg_respiration, avg_spo2, lowest_spo2
