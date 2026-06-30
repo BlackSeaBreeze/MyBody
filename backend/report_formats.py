@@ -408,7 +408,7 @@ def build_weekly_email_html(
     <div style="color:#888;font-size:13px;margin-bottom:16px;">{meta}</div>
     {disclaimer}
     {missing_note}
-    <h2 style="font-size:16px;margin:18px 0 10px;color:#374151;">Итоги недели и рекомендации</h2>
+    <h2 style="font-size:16px;margin:18px 0 10px;color:#374151;">Коучинг на неделю</h2>
     {analysis_html}
     <div style="color:#aaa;font-size:12px;margin-top:20px;">Сформировано автоматически сервисом MyBody.</div>
   </div>
@@ -640,19 +640,41 @@ def food_arithmetic_warning(analysis: str) -> str | None:
 
 
 _SECTION_TITLES: dict[str, str] = {
+    "today_do": "Сегодня сделай",
+    "week_focus": "Фокус на неделю",
+    "sleep": "Сон",
+    "activity": "Активность",
+    "nutrition": "Питание",
+    "cross_links": "Связи и причины",
+    "watch_out": "На что обратить внимание",
+    "data_coverage": "Покрытие данных",
+    # legacy — старые отчёты в GCS
     "executive_summary": "Краткий итог",
     "garmin_key_points": "Garmin — главное",
     "nutrition_key_points": "Питание — главное",
     "cross_domain_insights": "Связи Garmin и питания",
     "unified_recommendations": "Рекомендации на завтра",
-    "watch_out": "На что обратить внимание",
     "tomorrow_focus": "Фокус на завтра",
+    "user_notes_context": "Заметки",
+    "medical_key_points": "Медицина",
+    "sleep_weekly_trends": "Сон — тренды недели",
+    "activity_and_recovery": "Активность и recovery",
+    "nutrition_weekly_patterns": "Питание — паттерны недели",
+    "recommendations_next_week": "Рекомендации на неделю",
 }
 
 _SECTION_ACCENT: dict[str, str] = {
+    "today_do": "good",
+    "week_focus": "good",
+    "sleep": "neutral",
+    "activity": "neutral",
+    "nutrition": "neutral",
+    "cross_links": "neutral",
     "watch_out": "warn",
+    "data_coverage": "neutral",
     "tomorrow_focus": "good",
     "executive_summary": "neutral",
+    "recommendations_next_week": "good",
 }
 
 _WARN_RE = re.compile(
@@ -798,6 +820,83 @@ def _inline_md(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
 
 
+_MD_TABLE_LINE_RE = re.compile(r"^\s*\|.+\|\s*$|^\s*\|?.+\|.+\|?\s*$")
+
+
+def _split_md_table_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _is_md_table_separator_row(cells: list[str]) -> bool:
+    nonempty = [c.strip() for c in cells if c.strip()]
+    return bool(nonempty) and all(re.fullmatch(r":?-{3,}:?", c) for c in nonempty)
+
+
+def _is_md_table_line(line: str) -> bool:
+    s = line.strip()
+    if not s or "|" not in s:
+        return False
+    if s.startswith("|"):
+        return True
+    return s.count("|") >= 2 and _MD_TABLE_LINE_RE.match(s) is not None
+
+
+def _render_markdown_table_html(table_lines: list[str]) -> str:
+    """Markdown-таблица (| col | …) → HTML для email."""
+    rows: list[list[str]] = []
+    for line in table_lines:
+        cells = _split_md_table_row(line)
+        if not cells or _is_md_table_separator_row(cells):
+            continue
+        rows.append(cells)
+
+    if not rows:
+        return ""
+
+    ncols = max(len(r) for r in rows)
+    for row in rows:
+        while len(row) < ncols:
+            row.append("")
+
+    header = rows[0]
+    body = rows[1:]
+
+    th_cells = "".join(
+        f'<th style="padding:8px 10px;text-align:left;font-size:12px;font-weight:600;'
+        f"color:#1e3a5f;background:#eef2ff;border:1px solid #dbeafe;white-space:nowrap;"
+        f'">{_inline_md(c)}</th>'
+        for c in header
+    )
+
+    body_html_parts: list[str] = []
+    for i, row in enumerate(body):
+        bg = "#ffffff" if i % 2 == 0 else "#f9fafb"
+        td_cells = "".join(
+            f'<td style="padding:8px 10px;font-size:13px;line-height:1.4;color:#374151;'
+            f"border:1px solid #e5e7eb;background:{bg};"
+            f'{"font-weight:600;color:#111827;" if j == 0 else ""}">'
+            f"{_inline_md(cell)}</td>"
+            for j, cell in enumerate(row)
+        )
+        body_html_parts.append(f"<tr>{td_cells}</tr>")
+
+    tbody = f"<tbody>{''.join(body_html_parts)}</tbody>" if body_html_parts else ""
+    return (
+        '<div style="margin:12px 0 16px;overflow-x:auto;-webkit-overflow-scrolling:touch;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" '
+        'style="width:100%;min-width:280px;border-collapse:collapse;border:1px solid #e5e7eb;'
+        'border-radius:8px;overflow:hidden;font-family:Arial,Helvetica,sans-serif;">'
+        f"<thead><tr>{th_cells}</tr></thead>"
+        f"{tbody}"
+        "</table></div>"
+    )
+
+
 def _line_tone_heuristic(text: str, section_slug: str) -> str:
     accent = _SECTION_ACCENT.get(section_slug)
     if accent == "warn":
@@ -878,7 +977,7 @@ def _clean_line_body(body: str) -> str:
 def _render_line_html(content: str, section_slug: str, *, as_list_item: bool) -> str:
     tone, label, body = _parse_labeled_line(content, section_slug)
     tag = "li" if as_list_item else "p"
-    text_color = "#000" if section_slug == "executive_summary" else "#333"
+    text_color = "#000" if section_slug in ("executive_summary", "today_do", "week_focus") else "#333"
     base = f"margin:8px 0;padding:0;color:{text_color};line-height:1.55;list-style:none;"
 
     if label is not None:
@@ -894,7 +993,9 @@ def _render_line_html(content: str, section_slug: str, *, as_list_item: bool) ->
 
 
 def _section_header_style(accent: str, *, slug: str) -> str:
-    if slug == "executive_summary":
+    if slug in ("executive_summary", "today_do", "week_focus"):
+        if slug in ("today_do", "week_focus"):
+            return "background:#dcfce7;color:#166534;border-bottom:1px solid #bbf7d0;"
         return "background:#fff;color:#000;border-bottom:1px solid #e3e5e8;"
     if accent == "warn":
         return "background:#fee2e2;color:#991b1b;border-bottom:1px solid #fecaca;"
@@ -906,6 +1007,7 @@ def _section_header_style(accent: str, *, slug: str) -> str:
 def _render_body_lines(lines: list[str], section_slug: str) -> str:
     parts: list[str] = []
     list_buf: list[str] = []
+    table_buf: list[str] = []
 
     def flush_list() -> None:
         nonlocal list_buf
@@ -915,11 +1017,24 @@ def _render_body_lines(lines: list[str], section_slug: str) -> str:
         parts.append(f'<ul style="margin:0;padding:0;">{items}</ul>')
         list_buf = []
 
+    def flush_table() -> None:
+        nonlocal table_buf
+        if not table_buf:
+            return
+        parts.append(_render_markdown_table_html(table_buf))
+        table_buf = []
+
     for raw in lines:
         line = raw.strip()
         if not line:
             flush_list()
+            flush_table()
             continue
+        if _is_md_table_line(line):
+            flush_list()
+            table_buf.append(line)
+            continue
+        flush_table()
         h3 = re.match(r"^###\s+(.*)$", line)
         if h3:
             flush_list()
@@ -937,6 +1052,7 @@ def _render_body_lines(lines: list[str], section_slug: str) -> str:
         parts.append(_render_line_html(line, section_slug, as_list_item=False))
 
     flush_list()
+    flush_table()
     return "\n".join(parts)
 
 
@@ -948,12 +1064,12 @@ def _render_section(slug: str, body: str) -> str:
     elif slug == "tomorrow_focus":
         accent = "good"
 
-    if slug in ("unified_recommendations", "tomorrow_focus"):
+    if slug in ("unified_recommendations", "tomorrow_focus", "today_do", "week_focus", "recommendations_next_week"):
         body_html = _render_emoji_tagged_body(body.split("\n"))
     else:
         body_html = _render_body_lines(body.split("\n"), slug)
-    if slug == "executive_summary":
-        border = "#e3e5e8"
+    if slug in ("executive_summary", "today_do", "week_focus"):
+        border = "#bbf7d0" if slug in ("today_do", "week_focus") else "#e3e5e8"
         header_style = _section_header_style(accent, slug=slug)
     else:
         border = "#fecaca" if accent == "warn" else "#bbf7d0" if accent == "good" else "#e3e5e8"

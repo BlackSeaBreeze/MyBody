@@ -508,7 +508,7 @@ def _daily_email_html(
     <h2 style="font-size:16px;margin:18px 0 8px;color:#374151;">Показатели Garmin за день</h2>
     {table_html}
 
-    <h2 style="font-size:16px;margin:22px 0 10px;color:#374151;">Итоговый анализ и рекомендации</h2>
+    <h2 style="font-size:16px;margin:22px 0 10px;color:#374151;">Коучинг на сегодня</h2>
     {analysis_html}
     {attachment_note}
 
